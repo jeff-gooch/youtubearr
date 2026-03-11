@@ -1,0 +1,7 @@
+PLACEHOLDER
+
+This file must contain the official third-party license notices for the bundled
+yt-dlp binary. Download the exact file for the bundled version and replace this
+placeholder before publishing:
+
+https://raw.githubusercontent.com/yt-dlp/yt-dlp/2026.03.03/THIRD_PARTY_LICENSES.txt
