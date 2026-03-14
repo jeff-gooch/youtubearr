@@ -4,16 +4,17 @@ YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestream
 
 ## Features
 
-- **Manual Stream Addition**: Quickly add any YouTube livestream by pasting the URL
-- **Automatic Channel Monitoring**: Monitor YouTube channels and automatically add new livestreams (no API key)
-- **Auto-cleanup**: Automatically remove Dispatcharr channels when YouTube streams end
+- **Manual Stream Addition**: Add any YouTube livestream by pasting the URL
+- **Automatic Channel Monitoring**: Monitor YouTube channels and auto-add new livestreams
+- **Zero API Quota**: Uses yt-dlp instead of YouTube Data API - no API key needed
+- **Auto-cleanup**: Automatically remove channels when streams end
 - **URL Refresh**: Handles YouTube's expiring stream URLs automatically
+- **Sub-Channel Grouping**: Group related streams with decimal channels (90.1, 90.2, etc.)
+- **Title Filtering**: Regex filters for channels with many simultaneous streams
 - **Quality Selection**: Choose preferred stream quality (Best, 1080p, 720p, 480p)
-- **ZERO Python Dependencies**: Includes bundled yt-dlp, no extra pip installs
+- **Zero Dependencies**: Bundled yt-dlp binary, no pip installs required
 
 ## Installation
-
-### Simple Installation (Literally ZERO Dependencies!)
 
 1. Copy the `youtubearr` directory to your Dispatcharr plugins directory:
    ```bash
@@ -35,18 +36,7 @@ YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestream
 
 3. Enable the plugin in Dispatcharr UI (Settings → Plugins → YouTubearr)
 
-4. **Done!** Everything works immediately:
-   - ✅ Bundled yt-dlp binary (3.1MB included)
-   - ✅ YouTube Data API via Python's built-in `urllib`
-   - ✅ Manual URL addition
-   - ✅ Automatic monitoring
-   - ✅ Channel management
-
-**No pip install. No apt-get. No dependencies. It just works.**
-
-## No API Key Required
-
-YouTubearr uses yt-dlp to detect live streams and does not require a YouTube Data API key or quota.
+That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary handles everything.
 
 ## Configuration
 
@@ -71,7 +61,6 @@ YouTubearr uses yt-dlp to detect live streams and does not require a YouTube Dat
   - Example: Set to 3000 to start YouTube streams at channel 3000
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
   - Example: Set to 10 to assign channels 2000, 2010, 2020, etc.
-- **Channel Number Mapping**: Optional mapping of YouTube channels to base channel numbers for sub-channel grouping. See [Sub-Channel Numbering](#sub-channel-numbering) below.
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
 - **Dispatcharr Base URL**: Base URL for stream links in notifications (e.g., https://tv.example.com)
 
@@ -117,7 +106,7 @@ Without any configuration, streams are automatically grouped by YouTube channel:
 
 ### Custom Base Number Mapping (Optional)
 
-Use the **Channel Number Mapping** setting to assign specific base numbers:
+Assign specific base numbers directly in the **Monitored YouTube Channels** field:
 ```
 @WeatherChannel=90
 @SpaceChannel=91
@@ -197,11 +186,12 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 
 ## Technical Details
 
-- **yt-dlp**: Used for extracting streamable URLs from YouTube
-- **YouTube Data API v3**: Used for monitoring channels and detecting livestreams
+- **yt-dlp**: Used for all YouTube interactions (stream detection, URL extraction, metadata)
+- **Zero API Quota**: Uses `yt-dlp --flat-playlist` instead of YouTube Data API
 - **Stream URL Refresh**: Automatic refresh every 60 minutes to prevent expiration
 - **Channel Numbering**: Auto-assigned starting from 2000 to avoid conflicts
 - **Thread Safety**: Uses Django's select_for_update() to prevent race conditions
+- **Auto-Recovery**: Monitoring automatically resumes after container/service restarts
 
 ## Logs
 
@@ -214,9 +204,9 @@ tail -f /app/data/plugins/youtubearr/youtubearr.log
 
 ## Support
 
-- GitHub Issues: [Report bugs or request features]
-- Dispatcharr Documentation: https://github.com/Dispatcharr/Dispatcharr
+- GitHub Issues: https://github.com/jeff-gooch/Youtubearr/issues
+- Dispatcharr Discord: https://discord.gg/dispatcharr
 
 ## License
 
-This plugin follows Dispatcharr's licensing terms.
+This project is released under the [Unlicense](LICENSE) (public domain). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency licenses.

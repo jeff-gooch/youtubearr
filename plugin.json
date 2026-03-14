@@ -1,7 +1,7 @@
 {
   "name": "YouTubearr",
-  "version": "1.12.0",
+  "version": "1.12.1",
   "description": "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering",
-  "author": "Dispatcharr Community",
-  "help_url": "https://github.com/Dispatcharr/Dispatcharr"
+  "author": "Jeff Gooch",
+  "help_url": "https://github.com/jeff-gooch/Youtubearr"
 }

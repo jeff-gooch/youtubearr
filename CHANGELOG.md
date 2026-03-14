@@ -1,22 +1,28 @@
 # YouTubearr Changelog
 
-## [1.12.0] - 2026-03-11
+## [1.12.1] - 2026-03-13
 
-### Fixed - Ended Stream Detection + Handle Mapping
+### Fixed - Removed Stale API Key Requirement
+
+**Bug:** Plugin showed "YouTube API key required" error when starting monitoring or refreshing, even though API key was removed in v1.10.0.
 
 **Fixes:**
-- If YouTube API returns an error payload (HTTP 200 with `"error"`), now treated as an error and skipped to avoid false "stream ended" detections.
-- If API results are truncated (hit pagination limit), ended-stream detection is skipped for that channel to prevent false negatives.
-- Handle mapping now supports full `https://youtube.com/@handle` entries for fallback scanning.
+- Removed API key check from `_handle_start_monitoring()`
+- Removed API key check from `_handle_refresh()`
+- Fixed auto-restart check to use correct settings key (`monitored_channels` instead of `youtube_channels`)
 
-### Docs - Settings + Quota Clarifications
+**Result:** Plugin now works immediately with zero configuration beyond adding channels to monitor.
 
-- Documented **URL Refresh Interval** and **Dispatcharr Base URL** settings.
-- Clarified API quota reset as **midnight UTC** and noted pagination can increase quota usage.
+## [1.12.0] - 2026-03-11
 
-### Chore - Repo Sanitization
+### Added - GitHub Release
 
-- Replaced personal domains and IPs in examples with neutral placeholders.
+- Packaged plugin for GitHub distribution
+- Added LICENSE (Unlicense/public domain)
+- Added THIRD_PARTY_NOTICES.md for yt-dlp attribution
+- Added comprehensive THIRD_PARTY_LICENSES.txt for bundled yt-dlp dependencies
+- Added .gitignore for clean repository
+- Sanitized examples (removed personal domains/IPs)
 
 ## [1.11.3] - 2026-03-10
 

@@ -23,7 +23,7 @@ from core.models import StreamProfile
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.12.0"
+    version = "1.12.1"
     description = "Ingest YouTube livestreams into Dispatcharr channels with automatic monitoring"
     author = "Dispatcharr Community"
     help_url = "https://github.com/Dispatcharr/Dispatcharr"
@@ -303,9 +303,8 @@ class Plugin:
         # Auto-restart monitoring if DB says active but thread isn't running
         # This handles container/service restarts
         if monitoring_active and not self._monitoring_active:
-            api_key = settings.get("youtube_api_key", "").strip()
-            channels = settings.get("youtube_channels", "").strip()
-            if api_key and channels and self._ytdlp_path:
+            channels = settings.get("monitored_channels", "").strip()
+            if channels and self._ytdlp_path:
                 self._log("Auto-restarting monitoring after service restart")
                 self._monitoring_active = True
                 self._monitor_stop_event.clear()
@@ -469,10 +468,6 @@ class Plugin:
         if settings.get("monitoring_active"):
             return {"status": "running", "message": "Monitoring already active"}
 
-        api_key = settings.get("youtube_api_key", "").strip()
-        if not api_key:
-            return {"status": "error", "message": "YouTube API key required. See README for setup instructions."}
-
         monitored = settings.get("monitored_channels", "").strip()
         if not monitored:
             return {"status": "error", "message": "No channels to monitor. Add channel IDs/URLs in settings."}
@@ -545,10 +540,6 @@ class Plugin:
             settings = dict(cfg.settings or {})
         except PluginConfig.DoesNotExist:
             settings = context.get("settings", {})
-
-        api_key = settings.get("youtube_api_key", "").strip()
-        if not api_key:
-            return {"status": "error", "message": "YouTube API key required"}
 
         try:
             # Run one poll cycle
