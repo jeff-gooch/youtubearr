@@ -1,5 +1,27 @@
 # YouTubearr Changelog
 
+## [1.12.3] - 2026-03-14
+
+### Fixed - EPG Title vs Channel Name
+
+**Fix:** EPG entries now use the **stream title** for guide display, while channel names remain in the format `{YouTube Channel} #{N}`.
+
+**Result:** Channel names stay compact and consistent, while the EPG shows the actual livestream title.
+
+## [1.12.2] - 2026-03-14
+
+### Added - Auto-Create Dummy EPG
+
+**Feature:** Plugin now automatically creates a Dummy EPG source and assigns it to YouTube channels.
+
+**Changes:**
+- EPG Source Name now defaults to "YouTube Live" instead of empty
+- Automatically creates the Dummy EPG source if it doesn't exist
+- Automatically creates EPG data entries for each YouTube channel
+- No manual EPG setup required on fresh installs
+
+**Result:** YouTube channels now have guide data out of the box.
+
 ## [1.12.1] - 2026-03-13
 
 ### Fixed - Removed Stale API Key Requirement

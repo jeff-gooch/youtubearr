@@ -17,13 +17,13 @@ from django.utils import timezone
 
 from apps.plugins.models import PluginConfig
 from apps.channels.models import Channel, ChannelGroup, ChannelStream, Stream, Logo
-from apps.epg.models import EPGData
+from apps.epg.models import EPGData, EPGSource
 from core.models import StreamProfile
 
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.12.1"
+    version = "1.12.3"
     description = "Ingest YouTube livestreams into Dispatcharr channels with automatic monitoring"
     author = "Dispatcharr Community"
     help_url = "https://github.com/Dispatcharr/Dispatcharr"
@@ -164,14 +164,14 @@ class Plugin:
             "id": "info_epg",
             "label": "EPG Settings",
             "type": "info",
-            "description": "Automatically assign a Dummy EPG source to created channels.",
+            "description": "Automatically create and assign a Dummy EPG source to YouTube channels.",
         },
         {
             "id": "epg_source_name",
             "label": "EPG Source Name",
             "type": "string",
-            "default": "",
-            "help_text": "Name of the Dummy EPG source to assign to new channels (e.g., 'YouTube Live'). Must match exactly. Leave empty to skip EPG assignment.",
+            "default": "YouTube Live",
+            "help_text": "Name for the Dummy EPG source. Will be auto-created if it doesn't exist. Leave empty to skip EPG assignment.",
         },
     ]
 
@@ -863,16 +863,41 @@ class Plugin:
             stream_profile_id=self._get_stream_profile_id(),
         )
 
-        # Try to assign EPG source if configured
-        epg_source_name = settings.get("epg_source_name", "").strip()
+        # Auto-create and assign EPG if configured
+        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
         if epg_source_name:
             try:
-                epg_source = EPGData.objects.get(name=epg_source_name)
-                channel.epg_data = epg_source
+                # Get or create the Dummy EPG source
+                epg_source_obj, source_created = EPGSource.objects.get_or_create(
+                    name=epg_source_name,
+                    defaults={
+                        "source_type": "dummy",
+                        "is_active": True,
+                    }
+                )
+                if source_created:
+                    self._log(f"Created Dummy EPG source: {epg_source_name}")
+
+                # Get or create EPGData entry for this channel.
+                # Use tvg_id as the stable identifier and set name to the stream title for guide display.
+                epg_data, data_created = EPGData.objects.get_or_create(
+                    tvg_id=channel_name,
+                    epg_source=epg_source_obj,
+                    defaults={
+                        "name": video_title,
+                    }
+                )
+                if data_created:
+                    self._log(f"Created EPG data entry for: {channel_name}")
+                else:
+                    if epg_data.name != video_title:
+                        epg_data.name = video_title
+                        epg_data.save(update_fields=["name"])
+
+                # Assign to channel
+                channel.epg_data = epg_data
                 channel.save(update_fields=['epg_data'])
                 self._log(f"Assigned EPG '{epg_source_name}' to channel")
-            except EPGData.DoesNotExist:
-                self._log(f"EPG source '{epg_source_name}' not found")
             except Exception as epg_exc:
                 self._log(f"Could not assign EPG: {epg_exc}")
 
