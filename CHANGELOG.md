@@ -1,5 +1,11 @@
 # YouTubearr Changelog
 
+## [1.12.4] - 2026-03-14
+
+### Fixed - EPG Program Titles
+
+**Fix:** Added ProgramData entries so the EPG guide displays the livestream title while channel names stay in `{YouTube Channel} #{N}` format.
+
 ## [1.12.3] - 2026-03-14
 
 ### Fixed - EPG Title vs Channel Name

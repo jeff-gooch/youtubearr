@@ -8,7 +8,7 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timezone as dt_timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -17,13 +17,13 @@ from django.utils import timezone
 
 from apps.plugins.models import PluginConfig
 from apps.channels.models import Channel, ChannelGroup, ChannelStream, Stream, Logo
-from apps.epg.models import EPGData, EPGSource
+from apps.epg.models import EPGData, EPGSource, ProgramData
 from core.models import StreamProfile
 
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.12.3"
+    version = "1.12.4"
     description = "Ingest YouTube livestreams into Dispatcharr channels with automatic monitoring"
     author = "Dispatcharr Community"
     help_url = "https://github.com/Dispatcharr/Dispatcharr"
@@ -898,6 +898,19 @@ class Plugin:
                 channel.epg_data = epg_data
                 channel.save(update_fields=['epg_data'])
                 self._log(f"Assigned EPG '{epg_source_name}' to channel")
+
+                # Ensure a single program exists so the guide shows the stream title.
+                now = timezone.now()
+                ProgramData.objects.update_or_create(
+                    epg=epg_data,
+                    tvg_id=epg_data.tvg_id,
+                    defaults={
+                        "title": video_title,
+                        "description": video_title,
+                        "start_time": now,
+                        "end_time": now + timedelta(hours=12),
+                    },
+                )
             except Exception as epg_exc:
                 self._log(f"Could not assign EPG: {epg_exc}")
 
