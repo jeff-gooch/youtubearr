@@ -1,7 +1,52 @@
 THIRD-PARTY LICENSES
 
-This file aggregates license texts of third-party components included with the yt-dlp PyInstaller-bundled executables.
-yt-dlp itself is licensed under the Unlicense (see LICENSE file).
+This file aggregates license texts of third-party components bundled with YouTubearr.
+
+YouTubearr itself is licensed under the Unlicense (see LICENSE file).
+
+================================================================================
+QUICKJS-NG
+================================================================================
+
+QuickJS-NG is bundled as the `qjs` binary for yt-dlp JavaScript runtime support.
+
+Project: https://github.com/nicknash/quickjs-ng
+Version: 0.12.1
+
+--------------------------------------------------------------------------------
+QuickJS-NG | MIT License
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2024 QuickJS-NG authors
+Copyright (c) 2017-2021 Fabrice Bellard
+Copyright (c) 2017-2021 Charlie Gordon
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+YT-DLP AND DEPENDENCIES
+================================================================================
+
+The following licenses apply to yt-dlp and its bundled dependencies.
+yt-dlp itself is licensed under the Unlicense.
 Source code for bundled third-party components is available from the original projects.
 If you cannot obtain it, the maintainers will provide it as per license obligation; maintainer emails are listed in pyproject.toml.
 
@@ -2455,8 +2500,8 @@ URL: https://www.gnu.org/software/libidn/
 --------------------------------------------------------------------------------
 A. Unicode Copyright.
 
-    Copyright © 1991-2016 Unicode, Inc. All rights reserved.
-    Certain documents and files on this website contain a legend indicating that "Modification is permitted." Any person is hereby authorized, without fee, to modify such documents and files to create derivative works conforming to the Unicode® Standard, subject to Terms and Conditions herein.
+    Copyright ï¿½ 1991-2016 Unicode, Inc. All rights reserved.
+    Certain documents and files on this website contain a legend indicating that "Modification is permitted." Any person is hereby authorized, without fee, to modify such documents and files to create derivative works conforming to the Unicodeï¿½ Standard, subject to Terms and Conditions herein.
     Any person is hereby authorized, without fee, to view, use, reproduce, and distribute all documents and files solely for informational purposes and in the creation of products supporting the Unicode Standard, subject to the Terms and Conditions herein.
     Further specifications of rights and restrictions pertaining to the use of the particular set of data files known as the "Unicode Character Database" can be found in the License.
     Each version of the Unicode Standard has further specifications of rights and restrictions of use. For the book editions (Unicode 5.0 and earlier), these are found on the back of the title page. The online code charts carry specific restrictions. All other files, including online documentation of the core specification for Unicode 6.0 and later, are covered under these general Terms of Use.
@@ -2475,14 +2520,14 @@ D. Waiver of Damages.
  In no event shall Unicode or its licensors be liable for any special, incidental, indirect or consequential damages of any kind, or any damages whatsoever, whether or not Unicode was advised of the possibility of the damage, including, without limitation, those resulting from the following: loss of use, data or profits, in connection with the use, modification or distribution of this information or its derivatives.
 
 E. Trademarks & Logos.
-    The Unicode Word Mark and the Unicode Logo are trademarks of Unicode, Inc. “The Unicode Consortium” and “Unicode, Inc.” are trade names of Unicode, Inc. Use of the information and materials found on this website indicates your acknowledgement of Unicode, Inc.’s exclusive worldwide rights in the Unicode Word Mark, the Unicode Logo, and the Unicode trade names.
-    The Unicode Consortium Name and Trademark Usage Policy (“Trademark Policy”) are incorporated herein by reference and you agree to abide by the provisions of the Trademark Policy, which may be changed from time to time in the sole discretion of Unicode, Inc.
+    The Unicode Word Mark and the Unicode Logo are trademarks of Unicode, Inc. ï¿½The Unicode Consortiumï¿½ and ï¿½Unicode, Inc.ï¿½ are trade names of Unicode, Inc. Use of the information and materials found on this website indicates your acknowledgement of Unicode, Inc.ï¿½s exclusive worldwide rights in the Unicode Word Mark, the Unicode Logo, and the Unicode trade names.
+    The Unicode Consortium Name and Trademark Usage Policy (ï¿½Trademark Policyï¿½) are incorporated herein by reference and you agree to abide by the provisions of the Trademark Policy, which may be changed from time to time in the sole discretion of Unicode, Inc.
     All third party trademarks referenced herein are the property of their respective owners.
 
 F. Miscellaneous.
     Jurisdiction and Venue. This server is operated from a location in the State of California, United States of America. Unicode makes no representation that the materials are appropriate for use in other locations. If you access this server from other locations, you are responsible for compliance with local laws. This Agreement, all use of this site and any claims and damages resulting from use of this site are governed solely by the laws of the State of California without regard to any principles which would apply the laws of a different jurisdiction. The user agrees that any disputes regarding this site shall be resolved solely in the courts located in Santa Clara County, California. The user agrees said courts have personal jurisdiction and agree to waive any right to transfer the dispute to any other forum.
-    Modification by Unicode Unicode shall have the right to modify this Agreement at any time by posting it to this site. The user may not assign any part of this Agreement without Unicode’s prior written consent.
-    Taxes. The user agrees to pay any taxes arising from access to this website or use of the information herein, except for those based on Unicode’s net income.
+    Modification by Unicode Unicode shall have the right to modify this Agreement at any time by posting it to this site. The user may not assign any part of this Agreement without Unicodeï¿½s prior written consent.
+    Taxes. The user agrees to pay any taxes arising from access to this website or use of the information herein, except for those based on Unicodeï¿½s net income.
     Severability.  If any provision of this Agreement is declared invalid or unenforceable, the remaining provisions of this Agreement shall remain in effect.
     Entire Agreement. This Agreement constitutes the entire agreement between the parties.
 
@@ -2513,7 +2558,7 @@ THE DATA FILES OR SOFTWARE.
 
 COPYRIGHT AND PERMISSION NOTICE
 
-Copyright © 1991-2016 Unicode, Inc. All rights reserved.
+Copyright ï¿½ 1991-2016 Unicode, Inc. All rights reserved.
 Distributed under the Terms of Use in http://www.unicode.org/copyright.html.
 
 Permission is hereby granted, free of charge, to any person obtaining

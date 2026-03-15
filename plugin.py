@@ -23,10 +23,10 @@ from core.models import StreamProfile
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.12.4"
-    description = "Ingest YouTube livestreams into Dispatcharr channels with automatic monitoring"
-    author = "Dispatcharr Community"
-    help_url = "https://github.com/Dispatcharr/Dispatcharr"
+    version = "1.13.0"
+    description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
+    author = "Jeff Gooch"
+    help_url = "https://github.com/jeff-gooch/Youtubearr"
 
     fields = [
         {
@@ -125,6 +125,17 @@ class Plugin:
             "help_text": "How much to increment channel numbers for each new stream (default: 1)",
         },
         {
+            "id": "channel_numbering_mode",
+            "label": "Channel Numbering Mode",
+            "type": "select",
+            "default": "decimal",
+            "options": [
+                {"value": "decimal", "label": "Decimal (90.1, 90.2, 90.3)"},
+                {"value": "sequential", "label": "Sequential (2000, 2001, 2002)"},
+            ],
+            "help_text": "Decimal groups streams from the same YouTube channel together. Sequential avoids decimal issues with some systems.",
+        },
+        {
             "id": "info_webhook",
             "label": "Webhook Integration",
             "type": "info",
@@ -172,6 +183,19 @@ class Plugin:
             "type": "string",
             "default": "YouTube Live",
             "help_text": "Name for the Dummy EPG source. Will be auto-created if it doesn't exist. Leave empty to skip EPG assignment.",
+        },
+        {
+            "id": "info_advanced",
+            "label": "Advanced Settings",
+            "type": "info",
+            "description": "Settings for streams that require additional authentication.",
+        },
+        {
+            "id": "cookies_content",
+            "label": "YouTube Cookies",
+            "type": "text",
+            "default": "",
+            "help_text": "Paste YouTube cookies in Netscape format (cookies.txt content). Only used as fallback when streams fail to load without cookies. Get cookies using a browser extension like 'Get cookies.txt LOCALLY'.",
         },
     ]
 
@@ -245,6 +269,9 @@ class Plugin:
 
         # Check for yt-dlp binary
         self._ytdlp_path = self._find_ytdlp_binary()
+
+        # Check for QuickJS binary (for YouTube PO token extraction)
+        self._qjs_path = self._find_qjs_binary()
 
     def run(self, action: str, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Main entry point for all plugin actions"""
@@ -360,6 +387,7 @@ class Plugin:
 
         tracked_streams = settings.get("tracked_streams", {})
         quality = settings.get("stream_quality", "best")
+        cookies_content = settings.get("cookies_content", "")
 
         for url in urls:
             try:
@@ -388,7 +416,7 @@ class Plugin:
                         is_tracked = False
 
                 # Extract stream metadata
-                metadata = self._extract_stream_metadata(video_id, quality)
+                metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
 
                 if not metadata:
                     errors.append(f"Failed to extract info for video {video_id}")
@@ -655,26 +683,68 @@ class Plugin:
 
         return None
 
-    def _extract_stream_metadata(self, video_id: str, quality_preference: str = "best") -> Optional[Dict[str, Any]]:
-        """Extract stream metadata and URL using yt-dlp command-line tool"""
+    def _get_cookies_file(self, cookies_content: str) -> Optional[str]:
+        """Write cookies content to a temp file and return the path.
+
+        Returns None if cookies_content is empty or invalid.
+        """
+        if not cookies_content or not cookies_content.strip():
+            return None
+
+        # Write to a file in the plugin's data directory
+        cookies_file = self._base_dir / "cookies.txt"
+        try:
+            cookies_file.write_text(cookies_content.strip() + "\n")
+            self._log(f"Wrote cookies to {cookies_file}")
+            return str(cookies_file)
+        except Exception as exc:
+            self._log_error(f"Failed to write cookies file: {exc}")
+            return None
+
+    def _extract_stream_metadata(self, video_id: str, quality_preference: str = "best", cookies_content: str = "") -> Optional[Dict[str, Any]]:
+        """Extract stream metadata and URL using yt-dlp command-line tool.
+
+        Uses a fallback strategy:
+        1. First try without cookies (most streams work this way)
+        2. If that fails and cookies are configured, retry with cookies
+        """
         if not self._ytdlp_path:
             self._log_error("yt-dlp binary not found. Install with: pip install yt-dlp")
             return None
 
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        format_str = self._get_format_string(quality_preference)
+
+        # Build base yt-dlp command
+        base_cmd = [
+            self._ytdlp_path,
+            "--dump-json",
+            "--no-warnings",
+            "--format", format_str,
+        ]
+
+        # Add QuickJS runtime if available (needed for YouTube PO token extraction)
+        if self._qjs_path:
+            base_cmd.extend(["--js-runtimes", f"quickjs:{self._qjs_path}"])
+
+        # First attempt: try without cookies
+        cmd = base_cmd + [url]
+        result = self._run_ytdlp_extract(video_id, cmd)
+
+        # If first attempt failed and cookies are available, retry with cookies
+        if result is None and cookies_content:
+            cookies_file = self._get_cookies_file(cookies_content)
+            if cookies_file:
+                self._log(f"First attempt failed for {video_id}, retrying with cookies...")
+                cmd = base_cmd + ["--cookies", cookies_file, url]
+                result = self._run_ytdlp_extract(video_id, cmd, is_retry=True)
+
+        return result
+
+    def _run_ytdlp_extract(self, video_id: str, cmd: list, is_retry: bool = False) -> Optional[Dict[str, Any]]:
+        """Execute yt-dlp command and parse the result"""
+        retry_label = " (with cookies)" if is_retry else ""
         try:
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            format_str = self._get_format_string(quality_preference)
-
-            # Build yt-dlp command
-            cmd = [
-                self._ytdlp_path,
-                "--dump-json",
-                "--no-warnings",
-                "--format", format_str,
-                url
-            ]
-
-            # Run yt-dlp
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -683,16 +753,16 @@ class Plugin:
             )
 
             if result.returncode != 0:
-                self._log_error(f"yt-dlp failed for {video_id} (returncode={result.returncode})")
+                self._log_error(f"yt-dlp failed for {video_id}{retry_label} (returncode={result.returncode})")
                 self._log_error(f"yt-dlp stderr: {result.stderr[:500]}")  # First 500 chars
                 return None
 
             # Parse JSON output
-            self._log(f"yt-dlp succeeded for {video_id}, parsing JSON output...")
+            self._log(f"yt-dlp succeeded for {video_id}{retry_label}, parsing JSON output...")
             info = json.loads(result.stdout)
 
             if not info:
-                self._log_error(f"yt-dlp returned empty info for {video_id}")
+                self._log_error(f"yt-dlp returned empty info for {video_id}{retry_label}")
                 return None
 
             # Check live status
@@ -732,13 +802,13 @@ class Plugin:
             return metadata
 
         except subprocess.TimeoutExpired:
-            self._log_error(f"yt-dlp timed out for {video_id}")
+            self._log_error(f"yt-dlp timed out for {video_id}{retry_label}")
             return None
         except json.JSONDecodeError as exc:
-            self._log_error(f"Failed to parse yt-dlp output for {video_id}: {exc}")
+            self._log_error(f"Failed to parse yt-dlp output for {video_id}{retry_label}: {exc}")
             return None
         except Exception as exc:
-            self._log_error(f"Failed to extract metadata for {video_id}: {exc}")
+            self._log_error(f"Failed to extract metadata for {video_id}{retry_label}: {exc}")
             return None
 
     def _fetch_channel_avatar(self, channel_url: str) -> str:
@@ -753,7 +823,6 @@ class Plugin:
 
             # Look for channel avatar in various patterns
             # Pattern 1: "avatar":{"thumbnails":[{"url":"https://yt3.ggpht.com/...
-            import re
             patterns = [
                 r'"avatar"\s*:\s*\{\s*"thumbnails"\s*:\s*\[\s*\{\s*"url"\s*:\s*"([^"]+)"',
                 r'"thumbnails"\s*:\s*\[\s*\{\s*"url"\s*:\s*"(https://yt3\.ggpht\.com/[^"]+)"',
@@ -833,8 +902,22 @@ class Plugin:
         channel_number = self._get_channel_number_for_stream(youtube_channel_name, cfg.settings or {}, lookup_channel_id)
 
         # Format channel name as: {youtube_channel_name} #{stream_number}
-        # Extract stream number from sub-channel (e.g., 93.2 → #2)
-        stream_number = int(round((channel_number % 1) * 10))
+        numbering_mode = settings.get("channel_numbering_mode", "decimal")
+        if numbering_mode == "decimal":
+            # Extract stream number from sub-channel (e.g., 93.2 → #2)
+            decimal_part = channel_number % 1
+            if decimal_part > 0:
+                stream_number = int(round(decimal_part * 10))
+                if stream_number == 0:
+                    stream_number = int(round(decimal_part * 100))  # Handle .01, .02, etc.
+            else:
+                stream_number = 1
+        else:
+            # Sequential mode: count existing streams from this YouTube channel + 1
+            tracked_streams = settings.get("tracked_streams", {})
+            stream_count = sum(1 for s in tracked_streams.values()
+                             if s.get("youtube_channel_name", "").lower() == youtube_channel_name.lower())
+            stream_number = stream_count + 1
         channel_name = f"{youtube_channel_name} #{stream_number}"
 
         # Create or get Logo from channel thumbnail URL
@@ -879,31 +962,33 @@ class Plugin:
                     self._log(f"Created Dummy EPG source: {epg_source_name}")
 
                 # Get or create EPGData entry for this channel.
-                # Use tvg_id as the stable identifier and set name to the stream title for guide display.
+                # Use channel_number as tvg_id since Dispatcharr uses channel_number as the ID in EPG XML output.
+                channel_tvg_id = str(channel_number)
                 epg_data, data_created = EPGData.objects.get_or_create(
-                    tvg_id=channel_name,
+                    tvg_id=channel_tvg_id,
                     epg_source=epg_source_obj,
                     defaults={
                         "name": video_title,
                     }
                 )
                 if data_created:
-                    self._log(f"Created EPG data entry for: {channel_name}")
+                    self._log(f"Created EPG data entry for: {channel_name} (tvg_id={channel_tvg_id})")
                 else:
                     if epg_data.name != video_title:
                         epg_data.name = video_title
                         epg_data.save(update_fields=["name"])
 
-                # Assign to channel
+                # Assign to channel - set tvg_id to match channel_number for EPG XML output
                 channel.epg_data = epg_data
-                channel.save(update_fields=['epg_data'])
-                self._log(f"Assigned EPG '{epg_source_name}' to channel")
+                channel.tvg_id = channel_tvg_id
+                channel.save(update_fields=['epg_data', 'tvg_id'])
+                self._log(f"Assigned EPG '{epg_source_name}' to channel with tvg_id={channel_tvg_id}")
 
                 # Ensure a single program exists so the guide shows the stream title.
                 now = timezone.now()
                 ProgramData.objects.update_or_create(
                     epg=epg_data,
-                    tvg_id=epg_data.tvg_id,
+                    tvg_id=channel_tvg_id,
                     defaults={
                         "title": video_title,
                         "description": video_title,
@@ -1115,6 +1200,55 @@ class Plugin:
 
         return next_base
 
+    def _get_next_sequential_number(self, settings: Dict[str, Any]) -> int:
+        """Get the next available sequential channel number (whole numbers only).
+
+        Used when channel_numbering_mode is 'sequential'. Simply finds the next
+        available whole number, ignoring base/sub-channel grouping.
+        """
+        starting_number = settings.get("starting_channel_number", self._starting_channel_number)
+        increment = settings.get("channel_number_increment", 1)
+
+        try:
+            starting_number = int(starting_number)
+            increment = int(increment)
+        except (TypeError, ValueError):
+            starting_number = self._starting_channel_number
+            increment = 1
+
+        # Get all used channel numbers (as integers)
+        used_numbers = set()
+
+        # From tracked_streams
+        tracked_streams = settings.get("tracked_streams", {})
+        for stream_data in tracked_streams.values():
+            ch_num = stream_data.get("channel_number")
+            if ch_num is not None:
+                try:
+                    used_numbers.add(int(float(ch_num)))
+                except (TypeError, ValueError):
+                    pass
+
+        # From actual Dispatcharr channels in our group
+        group_name = settings.get("channel_group_name", self._channel_group_name)
+        try:
+            group = ChannelGroup.objects.get(name=group_name)
+            for ch_num in Channel.objects.filter(channel_group=group).values_list('channel_number', flat=True):
+                if ch_num is not None:
+                    try:
+                        used_numbers.add(int(float(ch_num)))
+                    except (TypeError, ValueError):
+                        pass
+        except ChannelGroup.DoesNotExist:
+            pass
+
+        # Find next available number
+        next_num = starting_number
+        while next_num in used_numbers:
+            next_num += increment
+
+        return next_num
+
     def _get_channel_number_for_stream(self, youtube_channel_name: str, settings: Dict[str, Any], youtube_channel_id: str = "") -> float:
         """Get channel number for a stream, using sub-channel mapping if configured.
 
@@ -1188,9 +1322,17 @@ class Plugin:
             base_number = self._get_next_unmapped_base_number(settings)
             self._log(f"Channel '{youtube_channel_name}' unmapped, assigning new base {base_number}")
 
-        # Get next sub-channel number
-        channel_number = self._get_next_subchannel_number(base_number, settings)
-        self._log(f"Assigned channel number {channel_number} for '{youtube_channel_name}'")
+        # Check numbering mode
+        numbering_mode = settings.get("channel_numbering_mode", "decimal")
+
+        if numbering_mode == "sequential":
+            # Sequential mode: use whole numbers only
+            channel_number = float(self._get_next_sequential_number(settings))
+            self._log(f"Assigned sequential channel number {int(channel_number)} for '{youtube_channel_name}'")
+        else:
+            # Decimal mode: use sub-channels (90.1, 90.2, etc.)
+            channel_number = self._get_next_subchannel_number(base_number, settings)
+            self._log(f"Assigned decimal channel number {channel_number} for '{youtube_channel_name}'")
 
         return channel_number
 
@@ -1312,7 +1454,8 @@ class Plugin:
                         # New livestream detected
                         self._log(f"New stream detected: {video_id}, extracting metadata...")
                         quality = settings.get("stream_quality", "best")
-                        metadata = self._extract_stream_metadata(video_id, quality)
+                        cookies_content = settings.get("cookies_content", "")
+                        metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
 
                         if not metadata:
                             self._log_error(f"Failed to extract metadata for {video_id} - yt-dlp returned None")
@@ -1485,7 +1628,7 @@ class Plugin:
                 error_data = json.loads(error_body)
                 error_message = error_data.get("error", {}).get("message", exc.reason)
                 self._log_error(f"YouTube API HTTP {exc.code}: {error_message}")
-            except:
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
                 if exc.code == 403:
                     self._log_error("YouTube API quota exceeded (403)")
                 elif exc.code in (400, 401):
@@ -1663,7 +1806,8 @@ class Plugin:
 
                     # Check if this video is actually live
                     self._log(f"Checking if video {video_id} is live...")
-                    metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"))
+                    cookies_content = settings.get("cookies_content", "")
+                    metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"), cookies_content)
 
                     if metadata and metadata.get("is_live"):
                         live_streams.append({
@@ -1744,7 +1888,8 @@ class Plugin:
 
                         # Check if this video is actually live by getting full metadata
                         self._log(f"Checking if video {video_id} is live...")
-                        metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"))
+                        cookies_content = settings.get("cookies_content", "")
+                        metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"), cookies_content)
 
                         if metadata and metadata.get("is_live"):
                             live_streams.append({
@@ -1955,7 +2100,8 @@ class Plugin:
                 if age_seconds > refresh_interval:
                     # Refresh needed
                     quality = settings.get("stream_quality", "best")
-                    metadata = self._extract_stream_metadata(video_id, quality)
+                    cookies_content = settings.get("cookies_content", "")
+                    metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
 
                     if metadata and metadata.get("stream_url"):
                         # Update Stream object
@@ -2307,4 +2453,27 @@ class Plugin:
                 continue
 
         self._log_error("yt-dlp not found. Plugin includes bundled version, but it may not be working.")
+        return None
+
+    def _find_qjs_binary(self) -> Optional[str]:
+        """Find QuickJS binary (bundled only - needed for YouTube PO token extraction)"""
+        bundled_qjs = self._base_dir / "qjs"
+        if bundled_qjs.exists() and bundled_qjs.is_file():
+            try:
+                bundled_qjs.chmod(0o755)
+                # Test it works - qjs --help returns exit code 1 but prints version info
+                result = subprocess.run(
+                    [str(bundled_qjs), "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                # Check for QuickJS version string in output (--help exits with 1)
+                if "QuickJS" in result.stdout or "QuickJS" in result.stderr:
+                    self._log(f"Using bundled QuickJS: {bundled_qjs}")
+                    return str(bundled_qjs)
+            except Exception as exc:
+                self._log_error(f"Bundled QuickJS failed: {exc}")
+
+        self._log("QuickJS (qjs) not found. Some YouTube streams may not work without it.")
         return None

@@ -1,5 +1,56 @@
 # YouTubearr Changelog
 
+## [1.13.0] - 2026-03-15
+
+### Added - Channel Numbering Mode (Issue #2)
+
+**Feature:** Choose between decimal sub-channels and sequential whole numbers.
+
+**New Setting:** Channel Numbering Mode
+- **Decimal** (default): 90.1, 90.2, 90.3 - groups streams from the same YouTube channel
+- **Sequential**: 2000, 2001, 2002 - for systems that don't handle decimal channels well
+
+**Use Case:** Some IPTV players or guide systems have issues with decimal channel numbers (e.g., treating 90.10 as 90.1). Switch to Sequential mode for full compatibility.
+
+### Added - Cookies Support
+
+**Feature:** Paste YouTube cookies directly in the settings UI.
+
+**New Setting:** YouTube Cookies
+- Paste cookies in Netscape format (from browser extension exports)
+- Cookies are used as fallback when stream extraction fails without authentication
+- Helps with age-restricted content or regional restrictions
+
+**How it works:**
+1. If stream extraction fails without cookies, plugin retries with cookies
+2. Cookies are stored in the plugin directory as `cookies.txt`
+3. No need to manually upload files
+
+### Added - QuickJS Runtime (Bundled)
+
+**Feature:** Bundled QuickJS-NG binary for yt-dlp's JavaScript runtime requirements.
+
+YouTube's PO token extraction sometimes requires a JavaScript runtime. The plugin now bundles QuickJS-NG and automatically uses it when available.
+
+**Technical details:**
+- QuickJS-NG v0.12.1 binary bundled as `qjs`
+- Automatically detected and used via `--js-runtimes quickjs:/path/to/qjs`
+- Falls back gracefully if QuickJS isn't working
+
+### Fixed - EPG Programme Data Not Showing
+
+**Bug:** EPG programmes for YouTube channels weren't appearing in the guide output.
+
+**Root cause:** The plugin was using channel names (e.g., "NASA #1") as tvg_id, but Dispatcharr's EPG XML output uses channel numbers (e.g., "92.1") as channel IDs. The mismatch meant programmes weren't linked to channels.
+
+**Fix:** Changed EPGData and ProgramData to use channel_number as tvg_id, matching Dispatcharr's EPG output format.
+
+### Fixed - Code Quality Issues
+
+- Fixed bare `except:` clause to catch specific exceptions
+- Removed redundant `import re` inside function
+- Fixed version number in Plugin class (was still showing 1.12.4)
+
 ## [1.12.4] - 2026-03-14
 
 ### Fixed - EPG Program Titles

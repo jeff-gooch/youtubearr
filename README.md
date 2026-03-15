@@ -57,29 +57,35 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
 - **URL Refresh Interval**: How often to refresh stream URLs (default: 3600 seconds)
 - **Channel Group**: Group name for created channels (default: "YouTube Live")
 - **Stream Quality**: Preferred quality for ingested streams (default: Best Available)
+- **Channel Numbering Mode**: How channel numbers are assigned
+  - **Decimal** (default): Groups streams by YouTube channel (90.1, 90.2, 90.3)
+  - **Sequential**: Simple whole numbers (2000, 2001, 2002) for IPTV players that don't handle decimals
 - **Starting Channel Number**: First channel number to assign (default: 2000)
   - Example: Set to 3000 to start YouTube streams at channel 3000
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
   - Example: Set to 10 to assign channels 2000, 2010, 2020, etc.
+- **YouTube Cookies**: Paste cookies in Netscape format for authenticated access
+  - Used as fallback when stream extraction fails
+  - Helps with age-restricted or region-locked content
+  - Export from browser using a cookies extension (e.g., "Get cookies.txt LOCALLY")
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
 - **Dispatcharr Base URL**: Base URL for stream links in notifications (e.g., https://tv.example.com)
 
 ## EPG Setup
 
-YouTubearr creates channels with EPG (Electronic Program Guide) data so you can see what's playing in your guide. This requires a Dummy EPG source in Dispatcharr and a guide refresh in Jellyfin.
+YouTubearr automatically creates EPG (Electronic Program Guide) data for each YouTube channel. The plugin stores programme entries directly in Dispatcharr's database with the livestream title.
 
-### Step 1: Create a Dummy EPG in Dispatcharr
+### Step 1: Create a Dummy EPG Source in Dispatcharr
 
 1. Go to **Settings → EPG** in Dispatcharr
 2. Click **Add Source**
 3. Select **Custom Dummy EPG** as the source type
 4. Set the name to **YouTube Live** (must match the EPG Source Name in YouTubearr settings)
-5. Configure the Dummy EPG settings:
-   - **Regex Pattern**: `(?P<title>.+)` (captures the full channel name as the title)
-   - **Program Duration**: `360` (6 hours, or adjust as needed)
-6. Click **Save**
+5. Click **Save**
 
-The Dummy EPG generates program entries based on channel names. YouTubearr creates channels with names like "NASA #1" and sets the EPG program title to the actual livestream title.
+That's it! YouTubearr handles programme data automatically - no Title Pattern or regex configuration needed.
+
+**Note:** The Dummy EPG source acts as a container for YouTubearr's programme data. The plugin creates `ProgramData` entries directly with the livestream title, bypassing the Dummy EPG's pattern-based generation.
 
 ### Step 2: Refresh the Guide in Jellyfin
 
@@ -139,13 +145,22 @@ curl "http://jellyfin:8096/ScheduledTasks?api_key=YOUR_API_KEY" | grep -A2 "Refr
 - **Refresh Now**: Immediately check for new/ended livestreams (bypasses poll interval)
 - **Cleanup**: Manually remove all channels for ended streams
 
-## Sub-Channel Numbering
+## Channel Numbering
 
-YouTubearr supports decimal sub-channels (e.g., 90.1, 90.2) to group streams from the same YouTube channel together in your guide.
+YouTubearr offers two channel numbering modes to suit different setups:
 
-### Automatic Grouping (Default)
+### Numbering Mode Setting
 
-Without any configuration, streams are automatically grouped by YouTube channel:
+Choose your preferred mode in **Channel Numbering Mode**:
+
+| Mode | Example | Best For |
+|------|---------|----------|
+| **Decimal** (default) | 90.1, 90.2, 90.3 | Grouping streams from the same YouTube channel together |
+| **Sequential** | 2000, 2001, 2002 | Systems that don't handle decimal channel numbers properly |
+
+### Decimal Mode (Default)
+
+Streams are automatically grouped by YouTube channel using decimal sub-channels:
 - First stream from Channel A → 2000.1
 - Second stream from Channel A → 2000.2
 - First stream from Channel B → 2001.1
@@ -171,6 +186,14 @@ Assign specific base numbers directly in the **Monitored YouTube Channels** fiel
 - Multiple YouTube channels can share the same base number to group related content
 - Unmapped channels automatically get assigned the next available base number
 - Sub-channels continue beyond .9 (e.g., .10, .11, .12)
+
+### Sequential Mode
+
+If your IPTV player or guide system has issues with decimal channel numbers (e.g., treating 90.10 as 90.1), switch to **Sequential Whole Numbers** mode:
+
+- All streams get unique whole numbers: 2000, 2001, 2002, etc.
+- Uses **Starting Channel Number** and **Channel Number Increment** settings
+- No grouping by YouTube channel - each stream is independent
 
 ### Title Filtering (For Channels with Many Streams)
 
@@ -233,9 +256,11 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 ## Technical Details
 
 - **yt-dlp**: Used for all YouTube interactions (stream detection, URL extraction, metadata)
+- **QuickJS Runtime**: Bundled QuickJS-NG binary for yt-dlp's JavaScript requirements (PO token extraction)
 - **Zero API Quota**: Uses `yt-dlp --flat-playlist` instead of YouTube Data API
 - **Stream URL Refresh**: Automatic refresh every 60 minutes to prevent expiration
 - **Channel Numbering**: Auto-assigned starting from 2000 to avoid conflicts
+- **Cookies Fallback**: Optional cookie authentication with automatic retry on extraction failure
 - **Thread Safety**: Uses Django's select_for_update() to prevent race conditions
 - **Auto-Recovery**: Monitoring automatically resumes after container/service restarts
 
