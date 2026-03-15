@@ -64,6 +64,52 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
 - **Dispatcharr Base URL**: Base URL for stream links in notifications (e.g., https://tv.example.com)
 
+## EPG Setup
+
+YouTubearr creates channels with EPG (Electronic Program Guide) data so you can see what's playing in your guide. This requires a Dummy EPG source in Dispatcharr and a guide refresh in Jellyfin.
+
+### Step 1: Create a Dummy EPG in Dispatcharr
+
+1. Go to **Settings → EPG** in Dispatcharr
+2. Click **Add Source**
+3. Select **Custom Dummy EPG** as the source type
+4. Set the name to **YouTube Live** (must match the EPG Source Name in YouTubearr settings)
+5. Configure the Dummy EPG settings:
+   - **Regex Pattern**: `(?P<title>.+)` (captures the full channel name as the title)
+   - **Program Duration**: `360` (6 hours, or adjust as needed)
+6. Click **Save**
+
+The Dummy EPG generates program entries based on channel names. YouTubearr creates channels with names like "NASA #1" and sets the EPG program title to the actual livestream title.
+
+### Step 2: Refresh the Guide in Jellyfin
+
+After YouTubearr adds new channels, Jellyfin needs to refresh its guide data to display them.
+
+#### Manual Refresh
+
+1. Open Jellyfin and go to **Dashboard → Scheduled Tasks**
+2. Find **Refresh Guide** in the task list
+3. Click the **Play** button to run it immediately
+
+#### Automatic Refresh (Recommended)
+
+Set up a scheduled refresh so new YouTube channels appear automatically:
+
+1. Go to **Dashboard → Scheduled Tasks → Refresh Guide**
+2. Click on the task to edit its schedule
+3. Set it to run every few hours (e.g., every 4 hours) or at specific times
+4. Click **Save**
+
+**Tip:** YouTubearr can trigger a Jellyfin webhook when channels are added. Set the **Webhook URL** in YouTubearr settings to:
+```
+http://jellyfin:8096/ScheduledTasks/Running/TASK_ID?api_key=YOUR_API_KEY
+```
+
+To find your Refresh Guide task ID:
+```bash
+curl "http://jellyfin:8096/ScheduledTasks?api_key=YOUR_API_KEY" | grep -A2 "RefreshGuide"
+```
+
 ## Usage
 
 ### Adding a Stream Manually
