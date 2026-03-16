@@ -23,7 +23,7 @@ from core.models import StreamProfile
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.14.0"
+    version = "1.14.2"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/Youtubearr"
@@ -245,6 +245,18 @@ class Plugin:
             "button_label": "Cleanup",
             "button_color": "red",
         },
+        {
+            "id": "reset_all",
+            "label": "Reset All Channels",
+            "description": "Remove ALL channels created by this plugin and clear tracking data. Use this to start fresh.",
+            "confirm": {
+                "required": True,
+                "title": "Reset All YouTubearr Channels?",
+                "message": "This will:\n• Stop monitoring\n• Delete ALL channels in the 'YouTube Live' group\n• Clear all tracked streams data\n\nThis cannot be undone!",
+            },
+            "button_label": "Reset All",
+            "button_color": "red",
+        },
     ]
 
     def __init__(self) -> None:
@@ -295,6 +307,8 @@ class Plugin:
             response = self._handle_refresh(context)
         elif action == "cleanup":
             response = self._handle_cleanup(context)
+        elif action == "reset_all":
+            response = self._handle_reset_all(context)
         else:
             response = {"status": "error", "message": f"Unknown action '{action}'"}
 
@@ -529,27 +543,26 @@ class Plugin:
 
     def _handle_stop_monitoring(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Stop background monitoring thread"""
-        # Check in-memory flag first, then DB
-        if not self._monitoring_active:
-            settings = context.get("settings", {})
-            if not settings.get("monitoring_active"):
-                return {"status": "stopped", "message": "Monitoring not active"}
+        # Check if monitoring is active (either in-memory or DB)
+        settings = context.get("settings", {})
+        if not self._monitoring_active and not settings.get("monitoring_active"):
+            return {"status": "stopped", "message": "Monitoring not active"}
 
-        # Set in-memory flag to stop
-        self._monitoring_active = False
-
-        # Signal thread to stop
-        self._monitor_stop_event.set()
-
-        # Wait for thread to finish (with timeout)
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=5.0)
-
-        # Update settings in DB
+        # Step 1: Set DB flag FIRST - this is what threads in other workers will see
         updates = {
             "monitoring_active": False,
         }
         self._persist_settings(updates)
+
+        # Step 2: Set in-memory flag to stop
+        self._monitoring_active = False
+
+        # Step 3: Signal thread to stop
+        self._monitor_stop_event.set()
+
+        # Step 4: Wait for thread to finish (with timeout)
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=5.0)
 
         self._log("Monitoring stopped")
 
@@ -649,6 +662,80 @@ class Plugin:
         except Exception as exc:
             self._log_error(f"Cleanup failed: {exc}")
             return {"status": "error", "message": f"Cleanup failed: {str(exc)}"}
+
+    def _handle_reset_all(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Reset all YouTubearr channels and tracking data to start fresh."""
+        try:
+            # Step 1: Force-stop monitoring by setting DB flag FIRST
+            # This ensures any running thread (even in another worker) will see the stop signal
+            try:
+                cfg = PluginConfig.objects.get(key=self._plugin_key)
+                tracked_count = len(cfg.settings.get("tracked_streams", {}))
+                cfg.settings["monitoring_active"] = False
+                cfg.settings["tracked_streams"] = {}  # Clear immediately to prevent re-adds
+                cfg.save(update_fields=["settings", "updated_at"])
+                self._log(f"Reset All: Set monitoring_active=False and cleared {tracked_count} tracked_streams")
+            except PluginConfig.DoesNotExist:
+                tracked_count = 0
+
+            # Step 2: Also call stop monitoring to set in-memory flag and stop event
+            self._monitoring_active = False
+            self._monitor_stop_event.set()
+            self._log("Reset All: Set in-memory stop flags")
+
+            # Step 3: Wait for any running monitoring thread to notice and stop
+            # The thread checks DB flag each poll cycle, so we wait a bit
+            time.sleep(3)
+            self._log("Reset All: Waited for monitoring thread to stop")
+
+            # Step 4: Get the channel group
+            try:
+                channel_group = ChannelGroup.objects.get(name=self._channel_group_name)
+            except ChannelGroup.DoesNotExist:
+                channel_group = None
+
+            # Step 5: Delete all channels in the YouTube Live group
+            channels_deleted = 0
+            streams_deleted = 0
+
+            if channel_group:
+                channels = Channel.objects.filter(channel_group=channel_group)
+                channels_deleted = channels.count()
+
+                # Get associated streams before deleting channels
+                for channel in channels:
+                    for stream in channel.streams.all():
+                        streams_deleted += 1
+                        stream.delete()
+                    channel.delete()
+
+                self._log(f"Reset All: Deleted {channels_deleted} channel(s) and {streams_deleted} stream(s)")
+
+            # Step 6: Clean up EPG data for this plugin's EPG source
+            epg_source_name = context.get("settings", {}).get("epg_source_name", "YouTube Live").strip()
+            epg_cleaned = 0
+            if epg_source_name:
+                try:
+                    from apps.epg.models import EPGData, ProgramData
+                    epg_source = EPGSource.objects.filter(name=epg_source_name).first()
+                    if epg_source:
+                        # Delete program data first
+                        ProgramData.objects.filter(epg__epg_source=epg_source).delete()
+                        # Then delete EPG data
+                        epg_cleaned = EPGData.objects.filter(epg_source=epg_source).count()
+                        EPGData.objects.filter(epg_source=epg_source).delete()
+                        self._log(f"Reset All: Deleted {epg_cleaned} EPG data entries")
+                except Exception as epg_exc:
+                    self._log(f"Reset All: EPG cleanup warning: {epg_exc}")
+
+            return {
+                "status": "success",
+                "message": f"Reset complete: {channels_deleted} channel(s), {streams_deleted} stream(s), {tracked_count} tracked entries cleared",
+            }
+
+        except Exception as exc:
+            self._log_error(f"Reset All failed: {exc}")
+            return {"status": "error", "message": f"Reset failed: {str(exc)}"}
 
     # --- YouTube URL Parsing ---
 
@@ -2113,7 +2200,10 @@ class Plugin:
                             # Update tracked metadata
                             stream_data["stream_url"] = metadata["stream_url"]
                             stream_data["last_url_refresh"] = now.isoformat()
-                            stream_data["is_live"] = metadata.get("is_live", False)
+                            # Only update is_live if explicitly present in metadata
+                            # Don't default to False as that causes premature cleanup
+                            if "is_live" in metadata:
+                                stream_data["is_live"] = metadata["is_live"]
 
                             refreshed_count += 1
                             self._log(f"Refreshed URL for: {stream_data.get('title')}")
@@ -2203,10 +2293,11 @@ class Plugin:
                     self._log_error("Plugin config not found, stopping monitoring")
                     break
 
-                # Re-persist monitoring_active to DB in case Dispatcharr overwrote it
+                # Check if monitoring was stopped via DB flag (e.g., by Stop button in another worker)
                 if not settings.get("monitoring_active"):
-                    self._log("DB shows monitoring_active=False but in-memory flag is True, re-persisting")
-                    self._persist_settings({"monitoring_active": True})
+                    self._log("DB shows monitoring_active=False, stopping monitoring thread")
+                    self._monitoring_active = False
+                    break
 
                 # Check API quota
                 if self._is_quota_exceeded(settings):

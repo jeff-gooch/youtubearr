@@ -1,5 +1,45 @@
 # YouTubearr Changelog
 
+## [1.14.2] - 2026-03-16
+
+### Fixed - Duplicate Channels for Same Stream
+
+**Bug:** Live streams would sometimes get duplicate channels created (e.g., same stream on 90.2 and 90.3).
+
+**Root cause:** During URL refresh, the code was setting `is_live: False` by default when metadata didn't explicitly include it. This caused the cleanup function to remove streams that were still live. When the next poll ran, the "new" stream was re-added with a new channel number.
+
+**Fix:** Only update `is_live` if explicitly present in the metadata, preserving the previous value otherwise.
+
+### Fixed - Stop Monitoring Not Working
+
+**Bug:** Clicking "Stop Monitoring" showed success but monitoring would continue or restart.
+
+**Root cause:** Multi-worker architecture issue - the monitoring thread could be running in a different worker process than the one handling the Stop action. The thread was also re-persisting `monitoring_active: True` when it saw the DB flag was False.
+
+**Fix:**
+- Stop now sets DB flag first (before in-memory flag) so all workers see it
+- Monitoring loop now trusts DB flag and stops instead of fighting it
+
+### Fixed - Reset All Race Condition
+
+**Bug:** Reset All would sometimes leave duplicate channels because monitoring kept running during the reset.
+
+**Fix:** Reset All now clears `tracked_streams` and sets `monitoring_active: False` in DB first, waits for thread to stop, then deletes channels.
+
+## [1.14.1] - 2026-03-16
+
+### Added - Reset All Channels Action
+
+**Feature:** New "Reset All Channels" button to completely start fresh.
+
+Performs these steps:
+1. Stops monitoring
+2. Clears all tracked streams data
+3. Deletes all channels in the "YouTube Live" group
+4. Cleans up associated EPG data
+
+Useful when channel numbers get out of sync or you want to reconfigure from scratch.
+
 ## [1.14.0] - 2026-03-15
 
 ### Fixed - EPG Not Appearing in Jellyfin
