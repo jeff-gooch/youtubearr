@@ -1,5 +1,19 @@
 # YouTubearr Changelog
 
+## [1.14.0] - 2026-03-15
+
+### Fixed - EPG Not Appearing in Jellyfin
+
+**Bug:** EPG data for YouTube streams showed correctly in Dispatcharr but not in Jellyfin.
+
+**Root cause:** Dispatcharr reads EPG directly from the database, but Jellyfin reads from XMLTV cache files at `/app/media/cached_epg/{source_id}.tmp`. YouTubearr was creating database records but never generating the XMLTV cache file.
+
+**Fix:** Added `_generate_xmltv_cache()` method that writes the EPG data to the XMLTV cache file before triggering the webhook. Now when streams are added:
+1. EPGData/ProgramData saved to database (Dispatcharr sees it immediately)
+2. XMLTV cache file generated
+3. Webhook triggers Jellyfin refresh
+4. Jellyfin reads updated XMLTV file
+
 ## [1.13.0] - 2026-03-15
 
 ### Added - Channel Numbering Mode (Issue #2)

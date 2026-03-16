@@ -1,5 +1,6 @@
-__pycache__/
-*.pyc
-youtubearr.log
-*.log
 claude.md
+.env
+*.log
+*.pyc
+__pycache__/
+youtubearr.log

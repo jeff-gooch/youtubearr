@@ -23,7 +23,7 @@ from core.models import StreamProfile
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.13.0"
+    version = "1.14.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/Youtubearr"
@@ -2297,10 +2297,75 @@ class Plugin:
         except PluginConfig.DoesNotExist:
             self._log_error("Plugin config not found")
 
+    # --- XMLTV Cache Generation ---
+
+    def _generate_xmltv_cache(self, settings: Dict[str, Any]) -> None:
+        """Generate XMLTV cache file for Jellyfin/external EPG readers.
+
+        Jellyfin reads EPG from XMLTV files at /app/media/cached_epg/{source_id}.tmp
+        This generates that file from the EPGData/ProgramData in the database.
+        """
+        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
+        if not epg_source_name:
+            return
+
+        try:
+            epg_source = EPGSource.objects.get(name=epg_source_name)
+        except EPGSource.DoesNotExist:
+            self._log(f"EPG source '{epg_source_name}' not found, skipping cache generation")
+            return
+
+        cache_path = f"/app/media/cached_epg/{epg_source.id}.tmp"
+
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+            def escape_xml(s: str) -> str:
+                if not s:
+                    return ""
+                return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                f.write('<tv generator-info-name="YouTubearr Plugin">\n')
+
+                # Write channels
+                for epg in EPGData.objects.filter(epg_source=epg_source):
+                    name = escape_xml(epg.name)
+                    f.write(f'  <channel id="{epg.tvg_id}">\n')
+                    f.write(f'    <display-name>{name}</display-name>\n')
+                    if epg.icon_url:
+                        f.write(f'    <icon src="{escape_xml(epg.icon_url)}"/>\n')
+                    f.write('  </channel>\n')
+
+                # Write programs
+                count = 0
+                for prog in ProgramData.objects.filter(epg__epg_source=epg_source).select_related("epg"):
+                    start = prog.start_time.strftime("%Y%m%d%H%M%S +0000")
+                    stop = prog.end_time.strftime("%Y%m%d%H%M%S +0000")
+                    title = escape_xml(prog.title or "")
+                    desc = escape_xml((prog.description or "")[:500])
+
+                    f.write(f'  <programme start="{start}" stop="{stop}" channel="{prog.epg.tvg_id}">\n')
+                    f.write(f'    <title>{title}</title>\n')
+                    if desc:
+                        f.write(f'    <desc>{desc}</desc>\n')
+                    f.write('  </programme>\n')
+                    count += 1
+
+                f.write('</tv>\n')
+
+            self._log(f"XMLTV cache generated: {count} programs at {cache_path}")
+
+        except Exception as e:
+            self._log_error(f"Failed to generate XMLTV cache: {e}")
+
     # --- Logging ---
 
     def _trigger_webhook(self, settings: Dict[str, Any]) -> None:
         """Trigger webhook URL when channels change (with configurable delay)"""
+        # Generate XMLTV cache before triggering webhook so Jellyfin has fresh data
+        self._generate_xmltv_cache(settings)
         webhook_url = settings.get("webhook_url", "").strip()
 
         if not webhook_url:
