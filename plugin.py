@@ -23,7 +23,7 @@ from core.models import StreamProfile
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.14.2"
+    version = "1.15.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/Youtubearr"
@@ -363,10 +363,6 @@ class Plugin:
         else:
             message_parts.append(f"Monitoring inactive ({len(tracked_streams)} streams tracked)")
 
-        api_calls = settings.get("api_calls_today", 0)
-        if api_calls > 0:
-            message_parts.append(f"API quota used today: {api_calls}/10000 units")
-
         return {
             "status": "running" if monitoring_active else "stopped",
             "message": " | ".join(message_parts) if message_parts else "Ready",
@@ -424,8 +420,48 @@ class Plugin:
                         skipped_count += 1
                         continue  # Channel exists, skip re-adding
                     except Channel.DoesNotExist:
-                        self._log(f"Stream {video_id} tracked but channel #{channel_id_to_check} was deleted, will re-add")
-                        # Remove from tracked_streams so it can be re-added
+                        self._log(f"Stream {video_id} tracked but channel #{channel_id_to_check} was deleted, checking for existing channel...")
+
+                        # Check if there's already another channel with this video before re-adding
+                        try:
+                            channel_group = ChannelGroup.objects.get(name=self._channel_group_name)
+                            existing_channel = None
+                            for ch in Channel.objects.filter(channel_group=channel_group):
+                                for stream in ch.streams.all():
+                                    if stream.url and video_id in stream.url:
+                                        existing_channel = ch
+                                        break
+                                    if stream.name and video_id in stream.name:
+                                        existing_channel = ch
+                                        break
+                                if existing_channel:
+                                    break
+
+                            if existing_channel:
+                                # Found existing channel - update tracked_streams to point to it
+                                self._log(f"Found existing channel #{existing_channel.id} ({existing_channel.channel_number}) with video {video_id}, updating tracked_streams")
+                                existing_stream = existing_channel.streams.first()
+                                tracked_streams[video_id] = {
+                                    "video_id": video_id,
+                                    "channel_id": existing_channel.id,
+                                    "stream_id": existing_stream.id if existing_stream else None,
+                                    "youtube_channel_id": tracked_streams[video_id].get("youtube_channel_id", ""),
+                                    "youtube_channel_name": tracked_streams[video_id].get("youtube_channel_name", ""),
+                                    "title": tracked_streams[video_id].get("title", ""),
+                                    "added_at": tracked_streams[video_id].get("added_at", timezone.now().isoformat()),
+                                    "last_url_refresh": timezone.now().isoformat(),
+                                    "stream_url": existing_stream.url if existing_stream else "",
+                                    "is_live": True,
+                                    "channel_number": existing_channel.channel_number,
+                                }
+                                self._persist_settings({"tracked_streams": tracked_streams})
+                                self._log(f"Stream {video_id} already exists as Channel #{existing_channel.channel_number}, skipping")
+                                skipped_count += 1
+                                continue  # Skip re-adding, we've linked to existing channel
+                        except ChannelGroup.DoesNotExist:
+                            pass
+
+                        # No existing channel found, remove from tracked_streams so it can be re-added
                         del tracked_streams[video_id]
                         is_tracked = False
 
@@ -885,7 +921,6 @@ class Plugin:
             }
 
             self._log(f"Metadata: title='{metadata['title'][:60]}...', channel='{channel_name}'")
-            self._log(f"DEBUG: channel_thumbnail='{metadata.get('channel_thumbnail', '')[:80]}', thumbnail='{metadata.get('thumbnail', '')[:80]}'")
             return metadata
 
         except subprocess.TimeoutExpired:
@@ -1530,8 +1565,49 @@ class Plugin:
                             self._log(f"Processing stream {video_id}: in_tracked=True, channel exists (#{channel_id_to_check}), skipping")
                             continue  # Channel exists, skip re-adding
                         except Channel.DoesNotExist:
-                            self._log(f"Processing stream {video_id}: in_tracked=True but channel #{channel_id_to_check} was deleted, will re-add")
-                            # Remove from tracked_streams so it can be re-added
+                            self._log(f"Processing stream {video_id}: in_tracked=True but channel #{channel_id_to_check} was deleted")
+
+                            # Check if there's already another channel with this video before re-adding
+                            # Look for channels in our group that have a stream containing this video ID
+                            try:
+                                channel_group = ChannelGroup.objects.get(name=self._channel_group_name)
+                                existing_channel = None
+                                for ch in Channel.objects.filter(channel_group=channel_group):
+                                    for stream in ch.streams.all():
+                                        if stream.url and video_id in stream.url:
+                                            existing_channel = ch
+                                            break
+                                        if stream.name and video_id in stream.name:
+                                            existing_channel = ch
+                                            break
+                                    if existing_channel:
+                                        break
+
+                                if existing_channel:
+                                    # Found existing channel - update tracked_streams to point to it
+                                    self._log(f"Found existing channel #{existing_channel.id} ({existing_channel.channel_number}) with video {video_id}, updating tracked_streams")
+                                    stream_obj = existing_channel.streams.first()
+                                    tracked_streams[video_id] = {
+                                        "video_id": video_id,
+                                        "channel_id": existing_channel.id,
+                                        "stream_id": stream_obj.id if stream_obj else None,
+                                        "monitored_channel_id": channel_id,
+                                        "youtube_channel_id": tracked_streams.get(video_id, {}).get("youtube_channel_id", ""),
+                                        "youtube_channel_name": tracked_streams.get(video_id, {}).get("youtube_channel_name", ""),
+                                        "title": stream_obj.name if stream_obj else "",
+                                        "added_at": tracked_streams.get(video_id, {}).get("added_at", timezone.now().isoformat()),
+                                        "last_url_refresh": timezone.now().isoformat(),
+                                        "stream_url": stream_obj.url if stream_obj else "",
+                                        "is_live": True,
+                                        "channel_number": existing_channel.channel_number,
+                                    }
+                                    self._persist_settings({"tracked_streams": tracked_streams})
+                                    continue  # Skip re-adding, we've linked to existing channel
+                            except ChannelGroup.DoesNotExist:
+                                pass
+
+                            # No existing channel found, proceed with re-adding
+                            self._log(f"No existing channel found for {video_id}, will re-add")
                             del tracked_streams[video_id]
                             self._persist_settings({"tracked_streams": tracked_streams})
                             is_tracked = False
@@ -1617,118 +1693,6 @@ class Plugin:
         })
 
         return added_count, ended_count
-
-    def _get_live_streams_for_channel(self, channel_id: str, api_key: str, settings: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """Get currently live streams for a YouTube channel using direct HTTP requests.
-
-        Args:
-            channel_id: YouTube channel ID
-            api_key: YouTube Data API key
-            settings: Plugin settings dict (optional, used for quota tracking)
-
-        Returns:
-            Dict with keys:
-              - "streams": list of stream info dicts
-              - "truncated": bool indicating results were truncated due to page limit
-            or None on API/network error. Returning None allows callers to distinguish
-            "no streams" from "error".
-
-        Supports pagination to fetch all live streams (up to 150 to limit API calls).
-        """
-        try:
-            live_streams = []
-            results_truncated = False
-            page_token = None
-            max_pages = 3  # Limit to 3 pages (150 streams) to avoid excessive API usage
-            pages_fetched = 0
-
-            for page_num in range(max_pages):
-                # Build YouTube Data API v3 search URL
-                params = {
-                    "part": "id,snippet",
-                    "channelId": channel_id,
-                    "eventType": "live",
-                    "type": "video",
-                    "maxResults": "50",  # Max allowed by API
-                    "key": api_key,
-                }
-                if page_token:
-                    params["pageToken"] = page_token
-
-                url = "https://www.googleapis.com/youtube/v3/search?" + urllib.parse.urlencode(params)
-                if page_num == 0:
-                    self._log(f"YouTube API request: {url.replace(api_key, 'API_KEY_HIDDEN')}")
-                else:
-                    self._log(f"YouTube API request (page {page_num + 1})")
-
-                # Make HTTP request
-                request = urllib.request.Request(url)
-                request.add_header("Accept", "application/json")
-
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    response_text = response.read().decode()
-                    data = json.loads(response_text)
-
-                pages_fetched += 1
-
-                # Track API quota for this page (100 units per search call)
-                if settings is not None:
-                    self._increment_api_quota(settings, 100)
-
-                # Parse items from this page
-                items = data.get("items", [])
-                for item in items:
-                    video_id = item.get("id", {}).get("videoId")
-                    if video_id:
-                        stream_info = {
-                            "video_id": video_id,
-                            "title": item.get("snippet", {}).get("title", "Unknown"),
-                            "thumbnail": item.get("snippet", {}).get("thumbnails", {}).get("high", {}).get("url", ""),
-                        }
-                        live_streams.append(stream_info)
-                        self._log(f"Found live stream: {stream_info['title']} (ID: {video_id})")
-
-                # Check for more pages
-                page_token = data.get("nextPageToken")
-                if not page_token:
-                    break
-
-                # Check if there are any errors in response
-                if "error" in data:
-                    self._log_error(f"API error in response: {data['error']}")
-                    return None
-
-            # Log summary
-            self._log(f"YouTube API response: {len(live_streams)} total live streams found")
-
-            # Warn if results may be truncated (hit page limit with more pages available)
-            if page_token:
-                self._log(f"WARNING: Results may be truncated (hit {max_pages} page limit). Some streams may not be detected.")
-                results_truncated = True
-
-            return {"streams": live_streams, "truncated": results_truncated}
-
-        except urllib.error.HTTPError as exc:
-            # Read error response body for more details
-            try:
-                error_body = exc.read().decode()
-                error_data = json.loads(error_body)
-                error_message = error_data.get("error", {}).get("message", exc.reason)
-                self._log_error(f"YouTube API HTTP {exc.code}: {error_message}")
-            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
-                if exc.code == 403:
-                    self._log_error("YouTube API quota exceeded (403)")
-                elif exc.code in (400, 401):
-                    self._log_error("Invalid YouTube API key (400/401)")
-                else:
-                    self._log_error(f"YouTube API HTTP error {exc.code}: {exc.reason}")
-            return None  # Return None on error, not [] - caller must handle this
-        except urllib.error.URLError as exc:
-            self._log_error(f"YouTube API network error: {exc.reason}")
-            return None  # Return None on error, not [] - caller must handle this
-        except Exception as exc:
-            self._log_error(f"YouTube API error: {exc}")
-            return None  # Return None on error, not [] - caller must handle this
 
     def _get_live_streams_via_ytdlp(self, channel_handle: str, settings: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         """Get currently live streams for a YouTube channel using yt-dlp flat-playlist.
@@ -1847,170 +1811,6 @@ class Plugin:
                     username_map[channel_id] = username
 
         return username_map
-
-    def _fallback_scan_username_streams(self, username: str, settings: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fallback scan using @username/streams URL (finds streams on ANY related channel)"""
-        try:
-            limit = settings.get("fallback_scan_limit", 10)
-
-            # Scrape the @username/streams page directly
-            # This shows ALL streams associated with that handle, regardless of which channel hosts them
-            channel_url = f"https://www.youtube.com/@{username}/streams"
-            self._log(f"Scraping @username streams page: {channel_url}")
-
-            cmd = [
-                self._ytdlp_path,
-                "--flat-playlist",
-                "--dump-json",
-                "--playlist-end", str(limit),
-                "--no-warnings",
-                channel_url
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-
-            if result.returncode != 0:
-                self._log(f"Failed to scrape {channel_url}: {result.stderr[:200]}")
-                return []
-
-            # Parse video IDs and check if they're live
-            live_streams = []
-            for line in result.stdout.strip().split('\n'):
-                if not line:
-                    continue
-
-                try:
-                    video_info = json.loads(line)
-                    video_id = video_info.get("id")
-
-                    if not video_id:
-                        continue
-
-                    # Check if this video is actually live
-                    self._log(f"Checking if video {video_id} is live...")
-                    cookies_content = settings.get("cookies_content", "")
-                    metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"), cookies_content)
-
-                    if metadata and metadata.get("is_live"):
-                        live_streams.append({
-                            "video_id": video_id,
-                            "title": metadata.get("title", "Unknown"),
-                            "thumbnail": metadata.get("thumbnail", ""),
-                        })
-                        self._log(f"✓ Found live stream via @{username}: {metadata.get('title')} (ID: {video_id})")
-
-                        if len(live_streams) >= limit:
-                            break
-                    else:
-                        self._log(f"✗ Video {video_id} is not live, skipping")
-
-                except json.JSONDecodeError:
-                    continue
-                except Exception as exc:
-                    self._log_error(f"Error checking video: {exc}")
-                    continue
-
-            return live_streams
-
-        except subprocess.TimeoutExpired:
-            self._log_error(f"yt-dlp timeout for @{username}/streams")
-            return []
-        except Exception as exc:
-            self._log_error(f"Fallback scan error for @{username}: {exc}")
-            return []
-
-    def _fallback_scan_channel_streams(self, channel_id: str, settings: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Fallback method: Use yt-dlp to scrape channel's /streams or /videos page for live videos"""
-        try:
-            limit = settings.get("fallback_scan_limit", 10)
-
-            # Try both /streams and /videos tabs
-            # Also try @username format if we have it in the original input
-            urls_to_try = [
-                f"https://www.youtube.com/channel/{channel_id}/streams",
-                f"https://www.youtube.com/channel/{channel_id}/videos",
-            ]
-
-            for channel_url in urls_to_try:
-                self._log(f"Scraping channel page: {channel_url}")
-
-                # Use yt-dlp to extract video IDs from the page
-                cmd = [
-                    self._ytdlp_path,
-                    "--flat-playlist",
-                    "--dump-json",
-                    "--playlist-end", str(limit),
-                    "--no-warnings",
-                    channel_url
-                ]
-
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-
-                if result.returncode != 0:
-                    self._log(f"Failed to scrape {channel_url}: {result.stderr[:200]}")
-                    continue  # Try next URL
-
-                # Parse each line as a JSON object (yt-dlp outputs one JSON per line in flat-playlist mode)
-                live_streams = []
-                for line in result.stdout.strip().split('\n'):
-                    if not line:
-                        continue
-
-                    try:
-                        video_info = json.loads(line)
-                        video_id = video_info.get("id")
-
-                        if not video_id:
-                            continue
-
-                        # Check if this video is actually live by getting full metadata
-                        self._log(f"Checking if video {video_id} is live...")
-                        cookies_content = settings.get("cookies_content", "")
-                        metadata = self._extract_stream_metadata(video_id, settings.get("stream_quality", "best"), cookies_content)
-
-                        if metadata and metadata.get("is_live"):
-                            live_streams.append({
-                                "video_id": video_id,
-                                "title": metadata.get("title", "Unknown"),
-                                "thumbnail": metadata.get("thumbnail", ""),
-                            })
-                            self._log(f"✓ Found live stream via fallback: {metadata.get('title')} (ID: {video_id})")
-
-                            # Stop if we've found enough
-                            if len(live_streams) >= limit:
-                                break
-                        else:
-                            self._log(f"✗ Video {video_id} is not live, skipping")
-
-                    except json.JSONDecodeError:
-                        continue
-                    except Exception as exc:
-                        self._log_error(f"Error checking video: {exc}")
-                        continue
-
-                # If we found live streams, return them
-                if live_streams:
-                    return live_streams
-
-            # Tried all URLs, found nothing
-            return []
-
-        except subprocess.TimeoutExpired:
-            self._log_error(f"yt-dlp fallback scan timed out for {channel_id}")
-            return []
-        except Exception as exc:
-            self._log_error(f"Fallback scan error for {channel_id}: {exc}")
-            return []
 
     def _parse_channel_ids(self, raw: str) -> List[str]:
         """Parse channel IDs from combined format string.
@@ -2220,6 +2020,43 @@ class Plugin:
 
         return refreshed_count
 
+    def _refresh_epg_times(self, settings: Dict[str, Any]) -> int:
+        """Refresh EPG programme times for all active streams.
+
+        Keeps EPG current by updating start/end times to now + 12 hours.
+        Returns count of refreshed programmes.
+        """
+        tracked_streams = settings.get("tracked_streams", {})
+        refreshed_count = 0
+
+        for video_id, stream_data in tracked_streams.items():
+            if not stream_data.get("is_live"):
+                continue
+
+            channel_id = stream_data.get("channel_id")
+            if not channel_id:
+                continue
+
+            try:
+                from django.utils import timezone as dj_timezone
+                channel = Channel.objects.get(id=channel_id)
+                if channel.epg_data:
+                    prog_now = dj_timezone.now()
+                    updated = ProgramData.objects.filter(
+                        epg=channel.epg_data
+                    ).update(
+                        start_time=prog_now,
+                        end_time=prog_now + timedelta(hours=12)
+                    )
+                    if updated > 0:
+                        refreshed_count += 1
+            except Channel.DoesNotExist:
+                pass
+            except Exception as exc:
+                self._log_error(f"Failed to refresh EPG for channel {channel_id}: {exc}")
+
+        return refreshed_count
+
     # --- Cleanup ---
 
     def _cleanup_ended_streams(self, settings: Dict[str, Any], force: bool = False) -> int:
@@ -2278,100 +2115,75 @@ class Plugin:
         """Background monitoring loop (runs in daemon thread)"""
         self._log("Monitoring loop started")
 
-        while not self._monitor_stop_event.is_set():
-            try:
-                # Check in-memory flag first (authoritative - DB flag can be overwritten by Dispatcharr)
-                if not self._monitoring_active:
-                    self._log("Monitoring disabled (in-memory flag), stopping")
-                    break
-
-                # Reload settings from database
+        try:
+            while not self._monitor_stop_event.is_set():
                 try:
-                    cfg = PluginConfig.objects.get(key=plugin_key)
-                    settings = dict(cfg.settings or {})
-                except PluginConfig.DoesNotExist:
-                    self._log_error("Plugin config not found, stopping monitoring")
-                    break
+                    # Check in-memory flag first (authoritative - DB flag can be overwritten by Dispatcharr)
+                    if not self._monitoring_active:
+                        self._log("Monitoring disabled (in-memory flag), stopping")
+                        break
 
-                # Check if monitoring was stopped via DB flag (e.g., by Stop button in another worker)
-                if not settings.get("monitoring_active"):
-                    self._log("DB shows monitoring_active=False, stopping monitoring thread")
-                    self._monitoring_active = False
-                    break
+                    # Reload settings from database
+                    try:
+                        cfg = PluginConfig.objects.get(key=plugin_key)
+                        settings = dict(cfg.settings or {})
+                    except PluginConfig.DoesNotExist:
+                        self._log_error("Plugin config not found, stopping monitoring")
+                        break
 
-                # Check API quota
-                if self._is_quota_exceeded(settings):
-                    self._log("API quota exceeded, pausing monitoring")
-                    self._monitor_stop_event.wait(3600)  # Wait 1 hour
-                    continue
+                    # Check if monitoring was stopped via DB flag (e.g., by Stop button in another worker)
+                    if not settings.get("monitoring_active"):
+                        self._log("DB shows monitoring_active=False, stopping monitoring thread")
+                        self._monitoring_active = False
+                        break
 
-                # Poll channels
-                try:
-                    added, ended = self._poll_monitored_channels(settings)
+                    # Poll channels
+                    try:
+                        added, ended = self._poll_monitored_channels(settings)
 
-                    # Refresh URLs
-                    refreshed = self._refresh_expiring_urls(settings)
+                        # Refresh URLs
+                        refreshed = self._refresh_expiring_urls(settings)
 
-                    # Cleanup if enabled
-                    if settings.get("auto_cleanup", True):
-                        cleaned = self._cleanup_ended_streams(settings)
-                    else:
-                        cleaned = 0
+                        # Keep EPG times current for all active streams
+                        self._refresh_epg_times(settings)
 
-                    # Trigger webhook if channels changed
-                    if added > 0 or cleaned > 0:
-                        self._trigger_webhook(settings)
+                        # Cleanup if enabled
+                        if settings.get("auto_cleanup", True):
+                            cleaned = self._cleanup_ended_streams(settings)
+                        else:
+                            cleaned = 0
+
+                        # Trigger webhook if channels changed
+                        if added > 0 or cleaned > 0:
+                            self._trigger_webhook(settings)
+
+                    except Exception as exc:
+                        self._log_error(f"Poll cycle error: {exc}")
+
+                    # Sleep for poll interval
+                    poll_interval = settings.get("poll_interval_minutes", 15)
+                    sleep_seconds = poll_interval * 60
+
+                    # Sleep in small chunks so we can respond to stop signal
+                    for _ in range(int(sleep_seconds)):
+                        if self._monitor_stop_event.is_set():
+                            break
+                        time.sleep(1)
 
                 except Exception as exc:
-                    self._log_error(f"Poll cycle error: {exc}")
+                    self._log_error(f"Monitoring loop error: {exc}")
+                    time.sleep(60)  # Back off on error
 
-                # Sleep for poll interval
-                poll_interval = settings.get("poll_interval_minutes", 15)
-                sleep_seconds = poll_interval * 60
-
-                # Sleep in small chunks so we can respond to stop signal
-                for _ in range(int(sleep_seconds)):
-                    if self._monitor_stop_event.is_set():
-                        break
-                    time.sleep(1)
-
-            except Exception as exc:
-                self._log_error(f"Monitoring loop error: {exc}")
-                time.sleep(60)  # Back off on error
+        finally:
+            # Always clean up flags when thread exits (crash, break, or normal exit)
+            self._log("Monitoring loop exiting, cleaning up flags")
+            self._monitoring_active = False
+            try:
+                self._persist_settings({"monitoring_active": False})
+            except Exception as cleanup_exc:
+                self._log_error(f"Failed to persist monitoring_active=False: {cleanup_exc}")
 
         self._log("Monitoring loop stopped")
-
-    # --- API Quota Management ---
-
-    def _increment_api_quota(self, settings: Dict[str, Any], units: int) -> None:
-        """Track API quota usage.
-
-        Only persists quota-related keys to avoid clobbering other settings
-        that may have been updated by concurrent operations.
-        """
-        today = datetime.now(dt_timezone.utc).date().isoformat()
-        quota_date = settings.get("quota_reset_date", "")
-
-        if quota_date != today:
-            # Reset quota for new day
-            self._persist_settings({
-                "api_calls_today": units,
-                "quota_reset_date": today
-            })
-            # Update local copy for caller
-            settings["api_calls_today"] = units
-            settings["quota_reset_date"] = today
-        else:
-            # Increment quota
-            new_count = settings.get("api_calls_today", 0) + units
-            self._persist_settings({"api_calls_today": new_count})
-            # Update local copy for caller
-            settings["api_calls_today"] = new_count
-
-    def _is_quota_exceeded(self, settings: Dict[str, Any]) -> bool:
-        """Check if API quota is exceeded (95% of 10,000 daily limit)"""
-        api_calls = settings.get("api_calls_today", 0)
-        return api_calls >= 9500
 
     # --- State Management ---
 
@@ -2505,7 +2317,6 @@ class Plugin:
                 self._log("Skipping Telegram notification: dispatcharr_base_url not configured")
                 return
             dispatcharr_url = f"{base_url}/proxy/ts/stream/{channel_uuid}"
-            self._log(f"DEBUG: channel_uuid={channel_uuid}, dispatcharr_url={dispatcharr_url}")
             payload = {
                 "title": metadata.get("title", "YouTube Live Stream"),
                 "channel": metadata.get("youtube_channel_name", "YouTube"),
@@ -2515,7 +2326,6 @@ class Plugin:
             }
 
             self._log(f"Sending Telegram notification for: {metadata.get('title', 'stream')[:60]}...")
-            self._log(f"DEBUG: payload={json.dumps(payload, indent=2)}")
 
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(telegram_url, data=data, method='POST')

@@ -1,5 +1,41 @@
 # YouTubearr Changelog
 
+## [1.15.0] - 2026-03-21
+
+### Changed - Code Cleanup & Reliability Improvements
+
+**Major code cleanup removing ~355 lines (13% reduction):**
+
+- Removed dead YouTube API code (`_get_live_streams_for_channel` method)
+- Removed fallback scan methods (`_fallback_scan_channel`, `_check_video_is_live`)
+- Removed API quota tracking (`_increment_api_quota`, `_reset_quota_if_needed`)
+- Removed DEBUG logging statements
+- Removed unused settings fields (fallback_scanning, api_calls_today, etc.)
+
+**Reliability improvements:**
+
+- Added `finally` block in monitoring loop for reliable cleanup on unexpected exits
+- Added `_refresh_epg_times()` - EPG programme times now refresh every poll cycle
+- EPG data stays current without manual intervention
+
+### Fixed
+
+- **Issue #3**: Verified notifications only fire for new streams, not URL refreshes
+  - `_send_telegram_notification()` only called in `_handle_add_manual()` and `_poll_monitored_channels()`
+  - URL refresh path (`_refresh_expiring_urls()`) does not trigger notifications
+
+## [1.14.3] - 2026-03-16
+
+### Fixed - Duplicate Channels from channel_id Mismatch
+
+**Bug:** Even after the 1.14.2 fix, duplicate channels were still being created. A stream would have channel 90.2 visible, but `tracked_streams` had `channel_id: 735` pointing to a different/deleted channel while the actual channel was id 734.
+
+**Root cause:** When checking if a tracked stream's channel still exists, the code only checked if the stored `channel_id` exists. If it didn't, it would delete from `tracked_streams` and re-add, creating a duplicate even though a valid channel with the same video already existed.
+
+**Fix:** Before re-adding a "deleted" channel, search the YouTube Live channel group for any existing channel with a stream containing the same video ID. If found, update `tracked_streams` to point to the existing channel instead of creating a duplicate. Applied to both:
+- Manual add section (`_handle_add_manual`)
+- Monitoring poll section (`_poll_monitored_channels`)
+
 ## [1.14.2] - 2026-03-16
 
 ### Fixed - Duplicate Channels for Same Stream
