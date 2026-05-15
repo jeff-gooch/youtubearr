@@ -1,5 +1,29 @@
 # YouTubearr Changelog
 
+## [1.18.0] - 2026-05-15
+
+### Fixed - Auto-scan live stream detection (root cause fix)
+
+**Bug:** Auto-scan has returned zero detected streams on every poll since v1.10.0. The `--flat-playlist` flag intentionally skips per-video page fetches, so `live_status` is always `null` for every entry. The filter `if live_status != "is_live"` silently dropped everything.
+
+**Fix:** Replaced single flat-playlist scan with a two-phase approach:
+- **Phase 1:** `--flat-playlist` collects video IDs from the `/streams` tab (fast, one request per channel)
+- **Phase 2:** Per-candidate `--print live_status` check (lightweight, no format selection or URL extraction)
+
+Only confirmed-live streams proceed to full metadata extraction. This restores correct detection while avoiding the original per-video `--dump-json` performance problem.
+
+### Fixed - QuickJS missing from live status checks
+
+`_verify_video_is_live()` was not passing `--js-runtimes quickjs` when QuickJS was available. For streams requiring PO token extraction, this caused false stream-endings (stream appeared ended when it was still live). Now matches `_extract_stream_metadata()` behavior.
+
+### Fixed - Subchannel decimal collision
+
+Channel numbers `.10`, `.20`, `.30` etc. were silently skipped because `float("90.10") == float("90.1")`, causing a collision with an already-assigned slot. The allocator now skips multiples of 10 when assigning decimal sub-channel numbers. Credit to @Schaka (PR #21) for identifying this.
+
+### Added - Max Streams to Scan per Channel setting
+
+New setting (default 15, range 5–50) controls how many entries are checked per channel per poll. Increase only for channels running more than 15 simultaneous streams.
+
 ## [1.17.7] - 2026-05-02
 
 ### Fixed
