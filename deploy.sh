@@ -9,6 +9,9 @@
 set -e
 
 TARGET="${1:-}"
+RUN_INTEGRATION=false
+[[ "${2:-}" == "--integration" ]] && RUN_INTEGRATION=true
+
 HOST="gooch@192.168.20.7"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -28,7 +31,7 @@ case "$TARGET" in
     # First-time test environment setup — see comments below
     ;;
   *)
-    echo "Usage: $0 [test|production|setup-test]"
+    echo "Usage: $0 [test|production|setup-test] [--integration]"
     exit 1
     ;;
 esac
@@ -36,15 +39,18 @@ esac
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 run_tests() {
-  echo "Running tests..."
+  echo "Running unit tests..."
   cd "$SCRIPT_DIR"
-  if command -v pytest &>/dev/null; then
-    pytest tests/ -v
-  else
-    nix-shell -p python3 --run "python3 -m pytest tests/ -v" 2>/dev/null \
-      || python -m unittest discover tests/ -v
+  nix-shell -p python3 --run "python3 -m unittest discover tests/ -v -p 'test_plugin.py'" 2>/dev/null \
+    || python -m unittest discover tests/ -v -p "test_plugin.py"
+  echo "Unit tests passed."
+
+  if $RUN_INTEGRATION; then
+    echo "Running integration tests (requires internet + real yt-dlp, ~60s)..."
+    nix-shell -p python3 --run "python3 -m unittest tests/test_integration.py -v" 2>/dev/null \
+      || python -m unittest tests/test_integration.py -v
+    echo "Integration tests passed."
   fi
-  echo "Tests passed."
 }
 
 deploy_files() {
