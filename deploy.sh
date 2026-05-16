@@ -116,14 +116,21 @@ case "$TARGET" in
     cp "$SCRIPT_DIR/qjs"        plugins/youtubearr/qjs
 
     git add plugins/youtubearr/
-    git commit -m "[youtubearr] Bump version to ${VERSION}" || { echo "Nothing to commit."; exit 0; }
+    if git diff --cached --quiet; then
+      echo "No file changes — branch may already be up to date."
+    else
+      git commit -m "[youtubearr] Bump version to ${VERSION}"
+    fi
     git push origin "$BRANCH"
 
-    echo ""
-    echo "Branch pushed. Open this URL to create the PR:"
-    echo "  https://github.com/jeff-gooch/plugins/pull/new/${BRANCH}"
-    echo "PR title: [youtubearr] Bump version to ${VERSION}"
-    echo "Base:     Dispatcharr/Plugins → main"
+    echo "Creating PR on dispatcharr/Plugins..."
+    nix-shell -p gh --run "gh pr create \
+      --repo Dispatcharr/Plugins \
+      --head jeff-gooch:${BRANCH} \
+      --base main \
+      --title '[youtubearr] Bump version to ${VERSION}' \
+      --body 'Bumps YouTubearr to v${VERSION}. See https://github.com/jeff-gooch/youtubearr/releases/tag/v${VERSION} for changelog.'" \
+    || echo "PR may already exist — check https://github.com/Dispatcharr/Plugins/pulls"
     ;;
 
   setup-test)
