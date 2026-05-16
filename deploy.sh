@@ -4,6 +4,7 @@
 # Usage:
 #   ./deploy.sh test          Deploy dev branch to dispatcharr-test
 #   ./deploy.sh production    Deploy to production dispatcharr
+#   ./deploy.sh publish       Submit version bump PR to dispatcharr/Plugins
 #   ./deploy.sh setup-test    First-time test environment setup
 
 set -e
@@ -27,11 +28,10 @@ case "$TARGET" in
     PLUGIN_PATH="/opt/dispatcharr/data/plugins/youtubearr"
     CONTAINER="dispatcharr"
     ;;
-  setup-test)
-    # First-time test environment setup — see comments below
+  publish|setup-test)
     ;;
   *)
-    echo "Usage: $0 [test|production|setup-test] [--integration]"
+    echo "Usage: $0 [test|production|publish|setup-test] [--integration]"
     exit 1
     ;;
 esac
@@ -92,6 +92,38 @@ case "$TARGET" in
     [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
     deploy_files
     restart_and_verify
+    ;;
+
+  publish)
+    VERSION=$(nix-shell -p python3 --run "python3 -c \"import json; print(json.load(open('$SCRIPT_DIR/plugin.json'))['version'])\"" 2>/dev/null \
+              || python -c "import json; print(json.load(open('$SCRIPT_DIR/plugin.json'))['version'])")
+    PLUGINS_DIR="/home/gooch/dispatcharr-plugins"
+    BRANCH="youtubearr/v${VERSION}"
+
+    echo "Publishing v${VERSION} to dispatcharr/Plugins..."
+
+    cd "$PLUGINS_DIR"
+    git fetch upstream
+    git checkout main
+    git merge upstream/main --ff-only
+    git push origin main
+
+    git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+
+    cp "$SCRIPT_DIR/plugin.py"   plugins/youtubearr/plugin.py
+    cp "$SCRIPT_DIR/plugin.json" plugins/youtubearr/plugin.json
+    cp "$SCRIPT_DIR/yt-dlp"     plugins/youtubearr/yt-dlp
+    cp "$SCRIPT_DIR/qjs"        plugins/youtubearr/qjs
+
+    git add plugins/youtubearr/
+    git commit -m "[youtubearr] Bump version to ${VERSION}" || { echo "Nothing to commit."; exit 0; }
+    git push origin "$BRANCH"
+
+    echo ""
+    echo "Branch pushed. Open this URL to create the PR:"
+    echo "  https://github.com/jeff-gooch/plugins/pull/new/${BRANCH}"
+    echo "PR title: [youtubearr] Bump version to ${VERSION}"
+    echo "Base:     Dispatcharr/Plugins → main"
     ;;
 
   setup-test)
