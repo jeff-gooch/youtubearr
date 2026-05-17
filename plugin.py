@@ -24,7 +24,7 @@ from core.scheduling import create_or_update_periodic_task, delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.18.0"
+    version = "1.19.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"
@@ -1691,8 +1691,11 @@ class Plugin:
 
                 self._log(f"Polling channel: @{username} ({channel_id})")
 
-                # Get live streams using yt-dlp flat-playlist (NO API quota!)
-                live_streams = self._get_live_streams_via_ytdlp(username, settings)
+                # Get live streams — pass per-channel title filter so it can be applied
+                # between Phase 1 and Phase 2, avoiding live checks on non-matching streams.
+                mapping = self._parse_channel_number_mapping(settings)
+                channel_filter = (mapping.get(channel_id) or {}).get("filter")
+                live_streams = self._get_live_streams_via_ytdlp(username, settings, title_filter=channel_filter)
 
                 # Handle errors - None means error occurred, skip this channel
                 if live_streams is None:
@@ -1700,18 +1703,6 @@ class Plugin:
                     continue
 
                 self._log(f"Found {len(live_streams)} live stream(s) on @{username}")
-
-                # Apply title filter BEFORE full extraction (saves time on channels with many streams)
-                if live_streams:
-                    filtered_streams = []
-                    for stream_info in live_streams:
-                        title = stream_info.get("title", "")
-                        if self._check_title_filter(title, channel_id, settings):
-                            filtered_streams.append(stream_info)
-
-                    if len(filtered_streams) < len(live_streams):
-                        self._log(f"Title filter: {len(filtered_streams)}/{len(live_streams)} streams match")
-                    live_streams = filtered_streams
 
                 # Check for new streams
                 self._log(f"Checking {len(live_streams)} stream(s) against tracked_streams (currently tracking {len(tracked_streams)} streams)")
@@ -1962,11 +1953,13 @@ class Plugin:
             self._log_error(f"Direct live check failed for {video_id}: {exc}, assuming live")
             return True
 
-    def _get_live_streams_via_ytdlp(self, channel_handle: str, settings: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    def _get_live_streams_via_ytdlp(self, channel_handle: str, settings: Dict[str, Any], title_filter: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """Get currently live streams for a YouTube channel using two-phase detection.
 
         Phase 1: flat-playlist scan to collect video IDs from /streams tab (fast, no per-video fetches).
-        Phase 2: per-video live_status check for each candidate (lightweight, no format selection).
+                 When a title_filter is set, scans up to 100 entries so the full channel is covered.
+        Phase 2: per-video live_status check — only for title-matched candidates when filter is set,
+                 otherwise for all candidates up to max_streams_per_channel.
 
         Uses NO API quota. Returns list of {video_id, title, thumbnail} dicts for confirmed-live
         streams only, or None on error (caller skips the channel).
@@ -1979,16 +1972,19 @@ class Plugin:
             return None
 
         streams_url = f"https://www.youtube.com/{channel_handle}/streams"
-        max_to_scan = int(settings.get("max_streams_per_channel", 15))
+        max_streams = int(settings.get("max_streams_per_channel", 15))
 
-        # Phase 1: collect video IDs via flat-playlist (fast — skips per-video pages intentionally)
-        self._log(f"Scanning {streams_url} (up to {max_to_scan} entries)")
+        # When a title filter is set, scan more entries in Phase 1 (cheap — one fast request)
+        # so we don't miss matching streams that sit beyond the default cap.
+        phase1_limit = 100 if title_filter else max_streams
+
+        self._log(f"Scanning {streams_url} (up to {phase1_limit} entries)")
         try:
             cmd = [
                 self._ytdlp_path,
                 "--flat-playlist",
                 "--dump-json",
-                "--playlist-end", str(max_to_scan),
+                "--playlist-end", str(phase1_limit),
                 "--no-warnings",
                 "--ignore-errors",
                 streams_url,
@@ -2014,6 +2010,23 @@ class Plugin:
 
             if not candidates:
                 self._log(f"No entries found on {streams_url}")
+                return []
+
+            # Apply title filter between phases — avoids live checks on non-matching streams.
+            # This is the key optimisation for channels with many simultaneous streams (e.g.
+            # VirtualRailfan's 70+ railcam feeds): Phase 1 fetches all 100, filter cuts to
+            # the 4-5 that match, Phase 2 only checks those.
+            if title_filter:
+                before = len(candidates)
+                try:
+                    candidates = [c for c in candidates if re.search(title_filter, c["title"], re.IGNORECASE)]
+                except re.error as e:
+                    self._log_error(f"Invalid title filter regex '{title_filter}': {e}")
+                if len(candidates) < before:
+                    self._log(f"Title filter: {len(candidates)}/{before} candidates match '{title_filter}'")
+
+            if not candidates:
+                self._log(f"No candidates match title filter for {channel_handle}")
                 return []
 
             self._log(f"Phase 1: {len(candidates)} candidate(s), checking live status...")

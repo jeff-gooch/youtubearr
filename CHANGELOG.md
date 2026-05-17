@@ -1,5 +1,11 @@
 # YouTubearr Changelog
 
+## [1.19.0] - 2026-05-17
+
+### Fixed - Title filter now applied before Phase 2 (VirtualRailfan / many-streams fix)
+
+For channels with a title filter configured, Phase 1 now scans up to 100 entries instead of the `max_streams_per_channel` cap (default 15). The filter is applied between Phase 1 and Phase 2, so live-status checks are only issued for matching streams. Previously, a channel with 70+ simultaneous streams and a filter would miss all matches beyond the first 15 entries.
+
 ## [1.18.0] - 2026-05-15
 
 ### Fixed - Auto-scan live stream detection (root cause fix)

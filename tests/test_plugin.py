@@ -169,6 +169,39 @@ class TestGetLiveStreams(unittest.TestCase):
         url = phase1_cmd[-1]
         self.assertIn("/@nasa/streams", url)
 
+    def test_title_filter_expands_phase1_limit_to_100(self):
+        p = _make_plugin()
+        with patch("subprocess.run", return_value=MagicMock(stdout="", returncode=0)) as mock_run:
+            p._get_live_streams_via_ytdlp("@virtualrailfan", {}, title_filter="Pennsylvania")
+        phase1_cmd = mock_run.call_args_list[0][0][0]
+        idx = phase1_cmd.index("--playlist-end")
+        self.assertEqual(phase1_cmd[idx + 1], "100")
+
+    def test_title_filter_excludes_non_matching_candidates_before_phase2(self):
+        p = _make_plugin()
+        entries = [
+            {"id": "match1", "title": "Pennsylvania Live"},
+            {"id": "skip1", "title": "La Grange Stream"},
+            {"id": "match2", "title": "Pennsylvania Railcam"},
+        ]
+        with patch("subprocess.run", side_effect=[
+            _phase1_result(entries),
+            _phase2_result("is_live"),
+            _phase2_result("is_live"),
+        ]) as mock_run:
+            result = p._get_live_streams_via_ytdlp("@virtualrailfan", {}, title_filter="Pennsylvania")
+        self.assertEqual(len(result), 2)
+        self.assertEqual([r["video_id"] for r in result], ["match1", "match2"])
+        self.assertEqual(mock_run.call_count, 3)  # phase1 + 2 phase2 (not 3)
+
+    def test_title_filter_returns_empty_when_no_candidates_match(self):
+        p = _make_plugin()
+        entries = [{"id": "skip1", "title": "La Grange Stream"}]
+        with patch("subprocess.run", side_effect=[_phase1_result(entries)]) as mock_run:
+            result = p._get_live_streams_via_ytdlp("@virtualrailfan", {}, title_filter="Pennsylvania")
+        self.assertEqual(result, [])
+        self.assertEqual(mock_run.call_count, 1)  # phase2 never runs
+
 
 # ── _verify_video_is_live ────────────────────────────────────────────────────
 
