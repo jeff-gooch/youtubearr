@@ -1113,5 +1113,365 @@ class TestGetRecentLogSummary(unittest.TestCase):
             tmp_path.unlink(missing_ok=True)
 
 
+class TestCeleryCleanup(unittest.TestCase):
+    """Legacy Celery beat task is removed and never re-registered."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._monitor_stop_event = MagicMock()
+        p._legacy_task_cleanup_done = False
+        return p
+
+    def test_create_or_update_not_in_plugin_namespace(self):
+        """create_or_update_periodic_task must not be imported — it would create the bogus task."""
+        import plugin as plugin_module
+        self.assertFalse(
+            hasattr(plugin_module, "create_or_update_periodic_task"),
+            "create_or_update_periodic_task must not appear in plugin.py",
+        )
+
+    def test_cleanup_calls_delete_with_correct_task_name(self):
+        p = self._make_p()
+        with patch("plugin.delete_periodic_task", return_value=True) as mock_del:
+            p._cleanup_legacy_celery_task()
+        mock_del.assert_called_once_with("youtubearr_youtubearr_health_check")
+
+    def test_cleanup_is_idempotent(self):
+        p = self._make_p()
+        with patch("plugin.delete_periodic_task", return_value=True) as mock_del:
+            p._cleanup_legacy_celery_task()
+            p._cleanup_legacy_celery_task()
+            p._cleanup_legacy_celery_task()
+        self.assertEqual(mock_del.call_count, 1)
+
+    def test_cleanup_swallows_db_exception(self):
+        p = self._make_p()
+        error_messages = []
+        p._log_error = lambda message: error_messages.append(message)
+        with patch("plugin.delete_periodic_task", side_effect=RuntimeError("DB down")):
+            p._cleanup_legacy_celery_task()  # must not raise
+        self.assertTrue(any("cleanup" in m.lower() for m in error_messages))
+
+    def test_cleanup_logs_when_task_deleted(self):
+        p = self._make_p()
+        messages = []
+        p._log = lambda m: messages.append(m)
+        with patch("plugin.delete_periodic_task", return_value=True):
+            p._cleanup_legacy_celery_task()
+        self.assertTrue(any("legacy" in m.lower() or "removed" in m.lower() for m in messages))
+
+    def test_cleanup_no_log_when_task_absent(self):
+        p = self._make_p()
+        messages = []
+        p._log = lambda m: messages.append(m)
+        with patch("plugin.delete_periodic_task", return_value=False):
+            p._cleanup_legacy_celery_task()
+        self.assertFalse(messages)
+
+    def test_handle_status_calls_cleanup(self):
+        p = self._make_p()
+        p._ytdlp_path = "/usr/bin/yt-dlp"
+        cleanup_calls = []
+        p._cleanup_legacy_celery_task = lambda: cleanup_calls.append(True)
+        p._ensure_monitoring_thread = MagicMock(return_value=False)
+        with patch("plugin.PluginConfig") as mock_cfg:
+            mock_cfg.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg.objects.get.side_effect = mock_cfg.DoesNotExist
+            p._handle_status({"settings": {}})
+        self.assertTrue(cleanup_calls)
+
+    def test_handle_status_missing_ytdlp_still_calls_cleanup(self):
+        """Even when yt-dlp is unavailable, _handle_status must call cleanup before returning early."""
+        p = self._make_p()
+        p._ytdlp_path = None  # missing yt-dlp triggers early return
+        cleanup_calls = []
+        p._cleanup_legacy_celery_task = lambda: cleanup_calls.append(True)
+        p._ensure_monitoring_thread = MagicMock(return_value=False)
+        with patch("plugin.PluginConfig") as mock_cfg:
+            mock_cfg.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg.objects.get.side_effect = mock_cfg.DoesNotExist
+            result = p._handle_status({"settings": {}})
+        self.assertTrue(cleanup_calls, "cleanup must run even when yt-dlp is missing")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("yt-dlp", result.get("message", ""))
+
+    def test_handle_start_monitoring_calls_cleanup(self):
+        p = self._make_p()
+        p._ytdlp_path = "/usr/bin/yt-dlp"
+        cleanup_calls = []
+        p._cleanup_legacy_celery_task = lambda: cleanup_calls.append(True)
+        p._persist_settings = MagicMock()
+        with patch("plugin.PluginConfig") as mock_cfg:
+            mock_cfg.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg.objects.get.side_effect = mock_cfg.DoesNotExist
+            with patch("threading.Thread") as mock_thread:
+                mock_thread.return_value.is_alive.return_value = False
+                p._handle_start_monitoring({"settings": {"monitored_channels": "@nasa"}})
+        self.assertTrue(cleanup_calls)
+
+    def test_handle_stop_monitoring_calls_cleanup(self):
+        p = self._make_p()
+        p._ytdlp_path = "/usr/bin/yt-dlp"
+        p._monitoring_active = True
+        cleanup_calls = []
+        p._cleanup_legacy_celery_task = lambda: cleanup_calls.append(True)
+        p._persist_settings = MagicMock()
+        with patch("plugin.PluginConfig") as mock_cfg:
+            mock_cfg.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg.objects.get.side_effect = mock_cfg.DoesNotExist
+            p._handle_stop_monitoring({"settings": {"monitoring_active": True}})
+        self.assertTrue(cleanup_calls)
+
+
+class TestEnsureMonitoringThread(unittest.TestCase):
+    """_ensure_monitoring_thread self-heals without Celery."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._monitor_stop_event = MagicMock()
+        p._legacy_task_cleanup_done = False
+        return p
+
+    def test_returns_false_when_monitoring_inactive(self):
+        p = self._make_p()
+        started = p._ensure_monitoring_thread({"monitoring_active": False})
+        self.assertFalse(started)
+        self.assertIsNone(p._monitor_thread)
+
+    def test_starts_thread_when_db_active_and_thread_dead(self):
+        p = self._make_p()
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        with patch("threading.Thread") as mock_thread:
+            mock_thread.return_value.is_alive.return_value = False
+            started = p._ensure_monitoring_thread(settings)
+        self.assertTrue(started)
+        self.assertTrue(p._monitoring_active)
+
+    def test_skips_when_heartbeat_is_recent(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": recent_hb,
+            "poll_interval_minutes": 15,
+        }
+        started = p._ensure_monitoring_thread(settings)
+        self.assertFalse(started)
+        self.assertIsNone(p._monitor_thread)
+
+    def test_restarts_when_heartbeat_is_stale(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": stale_hb,
+            "poll_interval_minutes": 15,
+        }
+        with patch("threading.Thread") as mock_thread:
+            mock_thread.return_value.is_alive.return_value = False
+            started = p._ensure_monitoring_thread(settings)
+        self.assertTrue(started)
+
+    def test_skips_when_no_channels_configured(self):
+        p = self._make_p()
+        settings = {"monitoring_active": True, "monitored_channels": ""}
+        started = p._ensure_monitoring_thread(settings)
+        self.assertFalse(started)
+
+    def test_skips_when_ytdlp_missing(self):
+        p = self._make_p()
+        p._ytdlp_path = None
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        started = p._ensure_monitoring_thread(settings)
+        self.assertFalse(started)
+
+    def test_skips_when_thread_already_alive(self):
+        p = self._make_p()
+        alive_thread = MagicMock()
+        alive_thread.is_alive.return_value = True
+        p._monitor_thread = alive_thread
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        started = p._ensure_monitoring_thread(settings)
+        self.assertFalse(started)
+
+
+class TestDiagnosticsNewFields(unittest.TestCase):
+    """Diagnostics surfaces legacy Celery task and stale URL count."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._legacy_task_cleanup_done = False
+        p._log_path = MagicMock()
+        p._log_path.exists.return_value = False
+        p._base_dir = MagicMock()
+        p._get_ytdlp_version = MagicMock(return_value="2025.01.01")
+        p._get_qjs_version = MagicMock(return_value="not configured")
+        return p
+
+    def test_legacy_celery_field_always_present(self):
+        p = self._make_p()
+        result = p._handle_diagnostics({"settings": {}})
+        self.assertIn("legacy_celery_health_check_present", result["details"])
+
+    def test_legacy_celery_field_unavailable_when_no_beat_package(self):
+        """Without django-celery-beat installed the field is an unavailable string."""
+        p = self._make_p()
+        # django_celery_beat is not in sys.modules by default in the test environment
+        result = p._handle_diagnostics({"settings": {}})
+        val = result["details"]["legacy_celery_health_check_present"]
+        # Must be either a bool (if package happened to be available) or a string
+        self.assertIsInstance(val, (bool, str))
+
+    def test_legacy_celery_warns_when_task_present(self):
+        p = self._make_p()
+        mock_pt = MagicMock()
+        mock_pt.objects.filter.return_value.exists.return_value = True
+        mock_beat_models = MagicMock()
+        mock_beat_models.PeriodicTask = mock_pt
+        with patch.dict(sys.modules, {
+            "django_celery_beat": MagicMock(),
+            "django_celery_beat.models": mock_beat_models,
+        }):
+            result = p._handle_diagnostics({"settings": {}})
+        self.assertTrue(result["details"]["legacy_celery_health_check_present"])
+        self.assertIn(result["status"], ("warning", "error"))
+
+    def test_legacy_celery_no_warning_when_task_absent(self):
+        p = self._make_p()
+        mock_pt = MagicMock()
+        mock_pt.objects.filter.return_value.exists.return_value = False
+        mock_beat_models = MagicMock()
+        mock_beat_models.PeriodicTask = mock_pt
+        with patch.dict(sys.modules, {
+            "django_celery_beat": MagicMock(),
+            "django_celery_beat.models": mock_beat_models,
+        }):
+            result = p._handle_diagnostics({"settings": {}})
+        self.assertFalse(result["details"]["legacy_celery_health_check_present"])
+
+    def test_stale_url_count_zero_when_no_live_streams(self):
+        p = self._make_p()
+        settings = {"tracked_streams": {"v1": {"is_live": False}}}
+        result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["stale_tracked_stream_url_count"], 0)
+
+    def test_stale_url_count_one_for_live_stream_with_no_refresh_timestamp(self):
+        p = self._make_p()
+        settings = {"tracked_streams": {"v1": {"is_live": True}}}
+        result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["stale_tracked_stream_url_count"], 1)
+        self.assertIn(result["status"], ("warning", "error"))
+
+    def test_stale_url_count_for_old_refresh(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=6)).isoformat()
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"v1": {"is_live": True, "last_url_refresh": old_ts}},
+        }
+        result = p._handle_diagnostics({"settings": settings})
+        self.assertGreater(result["details"]["stale_tracked_stream_url_count"], 0)
+        self.assertIn("oldest_url_refresh_age_seconds", result["details"])
+
+    def test_stale_url_count_zero_for_fresh_stream(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        now_ts = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"v1": {"is_live": True, "last_url_refresh": now_ts}},
+        }
+        result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["stale_tracked_stream_url_count"], 0)
+
+    def test_stale_url_invalid_timestamp_counts_as_stale(self):
+        p = self._make_p()
+        settings = {"tracked_streams": {"v1": {"is_live": True, "last_url_refresh": "bad-ts"}}}
+        result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["stale_tracked_stream_url_count"], 1)
+
+
+class TestRefreshExpiringUrls(unittest.TestCase):
+    """_refresh_expiring_urls refreshes stale stream URLs and persists the update."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._persist_settings = MagicMock()
+        return p
+
+    def test_refreshes_and_persists_when_url_stale(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=3)).isoformat()
+        stream_data = {
+            "is_live": True,
+            "last_url_refresh": old_ts,
+            "stream_id": 42,
+            "title": "Live Stream",
+        }
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"vid1": stream_data},
+        }
+        new_url = "https://refreshed.example.com/stream.m3u8"
+        p._extract_stream_metadata = MagicMock(return_value={"stream_url": new_url})
+        mock_stream = MagicMock()
+        with patch("plugin.Stream") as mock_stream_cls:
+            mock_stream_cls.objects.get.return_value = mock_stream
+            count = p._refresh_expiring_urls(settings)
+        self.assertEqual(count, 1)
+        p._persist_settings.assert_called_once()
+        self.assertEqual(stream_data["stream_url"], new_url)
+
+    def test_skips_non_live_streams(self):
+        p = self._make_p()
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"vid1": {"is_live": False, "last_url_refresh": "2020-01-01T00:00:00+00:00"}},
+        }
+        p._extract_stream_metadata = MagicMock()
+        count = p._refresh_expiring_urls(settings)
+        self.assertEqual(count, 0)
+        p._extract_stream_metadata.assert_not_called()
+
+    def test_skips_streams_without_last_url_refresh(self):
+        p = self._make_p()
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"vid1": {"is_live": True}},
+        }
+        p._extract_stream_metadata = MagicMock()
+        count = p._refresh_expiring_urls(settings)
+        self.assertEqual(count, 0)
+        p._extract_stream_metadata.assert_not_called()
+
+    def test_no_persist_when_nothing_refreshed(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        now_ts = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {"vid1": {"is_live": True, "last_url_refresh": now_ts}},
+        }
+        p._extract_stream_metadata = MagicMock()
+        p._refresh_expiring_urls(settings)
+        p._persist_settings.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

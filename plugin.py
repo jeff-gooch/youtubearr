@@ -19,7 +19,7 @@ from apps.plugins.models import PluginConfig
 from apps.channels.models import Channel, ChannelGroup, ChannelStream, Stream, Logo, ChannelProfile, ChannelProfileMembership
 from apps.epg.models import EPGData, EPGSource, ProgramData
 from core.models import StreamProfile
-from core.scheduling import create_or_update_periodic_task, delete_periodic_task
+from core.scheduling import delete_periodic_task
 
 
 class Plugin:
@@ -370,6 +370,8 @@ class Plugin:
         # Track video IDs that recently failed metadata extraction to avoid retrying every poll
         self._extraction_failures: Dict[str, float] = {}  # video_id -> unix timestamp of failure
 
+        self._legacy_task_cleanup_done = False
+
         # Field defaults
         self._field_defaults = {field["id"]: field.get("default") for field in self.fields}
 
@@ -426,8 +428,7 @@ class Plugin:
 
     def _handle_status(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Return current status"""
-        # IMPORTANT: Always read fresh settings from DB for auto-restart check
-        # Context settings may be stale (e.g., from Celery beat health check)
+        # Always read fresh settings from DB for auto-restart check
         try:
             cfg = PluginConfig.objects.get(key=self._plugin_key)
             settings = dict(cfg.settings or {})
@@ -437,6 +438,10 @@ class Plugin:
         tracked_streams = settings.get("tracked_streams", {})
         monitoring_active = settings.get("monitoring_active", False)
 
+        # Clean up the bogus Celery beat task left by older plugin versions (once per instance)
+        # Must run before any early return, so it fires even when yt-dlp is missing.
+        self._cleanup_legacy_celery_task()
+
         # Check yt-dlp availability
         if not self._ytdlp_path:
             return {
@@ -444,47 +449,8 @@ class Plugin:
                 "message": "yt-dlp not found (bundled version may not be working). Check logs.",
             }
 
-        # Auto-restart monitoring if DB says active but no thread is actually running
-        # This handles container/service restarts AND crashed/hung threads
-        # IMPORTANT: We can't rely on self._monitor_thread because each Celery worker
-        # creates a new Plugin instance with _monitor_thread=None. Instead, we check
-        # the monitoring_heartbeat timestamp to see if a thread is actively polling.
-        thread_dead = not self._monitor_thread or not self._monitor_thread.is_alive()
-
-        # Check if another thread is actually running by looking at heartbeat
-        heartbeat_str = settings.get("monitoring_heartbeat")
-        heartbeat_recent = False
-        if heartbeat_str:
-            try:
-                heartbeat = datetime.fromisoformat(heartbeat_str.replace("Z", "+00:00"))
-                if isinstance(heartbeat.tzinfo, type(None)):
-                    heartbeat = heartbeat.replace(tzinfo=dt_timezone.utc)
-                age_seconds = (datetime.now(dt_timezone.utc) - heartbeat).total_seconds()
-                # Heartbeat threshold must be longer than poll_interval + poll_duration
-                # Poll cycles can take 5-10 minutes with many channels, so use poll_interval + 10 min buffer
-                poll_interval_minutes = settings.get("poll_interval_minutes", 15)
-                heartbeat_threshold = (poll_interval_minutes + 10) * 60  # e.g., 25 minutes for 15-min poll
-                heartbeat_recent = age_seconds < heartbeat_threshold
-                if heartbeat_recent:
-                    self._log(f"Monitoring heartbeat is recent ({int(age_seconds)}s ago, threshold={heartbeat_threshold}s), skipping auto-restart")
-            except (ValueError, TypeError):
-                pass
-
-        if monitoring_active and thread_dead and not heartbeat_recent:
-            channels = settings.get("monitored_channels", "").strip()
-            if channels and self._ytdlp_path:
-                self._log("Auto-restarting monitoring after service restart")
-                self._monitoring_active = True
-                self._monitor_stop_event.clear()
-                self._monitor_thread = threading.Thread(
-                    target=self._monitoring_loop,
-                    args=(self._plugin_key,),
-                    daemon=True,
-                    name="YouTubearr-Monitor"
-                )
-                self._monitor_thread.start()
-                # Ensure Celery beat health check is registered (idempotent)
-                self._register_celery_health_check()
+        # Self-heal: restart the monitor thread if DB says active but no live thread exists
+        self._ensure_monitoring_thread(settings)
 
         message_parts = []
         if monitoring_active:
@@ -731,9 +697,7 @@ class Plugin:
         self._monitor_thread.start()
 
         self._log("Monitoring started")
-
-        # Register Celery beat health check for auto-recovery
-        self._register_celery_health_check()
+        self._cleanup_legacy_celery_task()
 
         return {
             "status": "running",
@@ -766,9 +730,7 @@ class Plugin:
             self._monitor_thread.join(timeout=5.0)
 
         self._log("Monitoring stopped")
-
-        # Unregister Celery beat health check
-        self._unregister_celery_health_check()
+        self._cleanup_legacy_celery_task()
 
         return {
             "status": "stopped",
@@ -1035,6 +997,46 @@ class Plugin:
             if isinstance(details.get(key), str) and "unavailable" in details[key]:
                 issues.append(f"warning:{key} count unavailable")
         details["epg_counts"] = self._get_epg_counts(settings)
+
+        # Legacy Celery beat task presence
+        try:
+            from django_celery_beat.models import PeriodicTask as _PT
+            _task_name = f"youtubearr_{self._plugin_key}_health_check"
+            present = _PT.objects.filter(name=_task_name).exists()
+            details["legacy_celery_health_check_present"] = present
+            if present:
+                issues.append("warning:legacy Celery beat task present — causes unregistered-task spam; will auto-remove on next status/start action")
+        except Exception as _exc:
+            details["legacy_celery_health_check_present"] = f"unavailable: {_exc}"
+
+        # Stale stream URLs (live streams whose URL hasn't been refreshed recently)
+        _url_refresh_interval = settings.get("url_refresh_interval_seconds", 3600)
+        _stale_threshold = 2 * _url_refresh_interval
+        _now_utc = datetime.now(dt_timezone.utc)
+        stale_count = 0
+        oldest_stale_age = 0.0
+        for _vid, _sd in tracked_streams.items():
+            if not _sd.get("is_live"):
+                continue
+            _last_str = _sd.get("last_url_refresh")
+            if not _last_str:
+                stale_count += 1
+                continue
+            try:
+                _lr = datetime.fromisoformat(_last_str.replace("Z", "+00:00"))
+                if _lr.tzinfo is None:
+                    _lr = _lr.replace(tzinfo=dt_timezone.utc)
+                _age = (_now_utc - _lr).total_seconds()
+                if _age > _stale_threshold:
+                    stale_count += 1
+                    oldest_stale_age = max(oldest_stale_age, _age)
+            except (ValueError, TypeError):
+                stale_count += 1
+        details["stale_tracked_stream_url_count"] = stale_count
+        if oldest_stale_age:
+            details["oldest_url_refresh_age_seconds"] = int(oldest_stale_age)
+        if stale_count > 0:
+            issues.append(f"warning:{stale_count} live stream URL(s) are stale (monitor may not be refreshing URLs)")
 
         # Recent log summary
         details["log_summary"] = self._get_recent_log_summary()
@@ -3183,32 +3185,72 @@ class Plugin:
             json.dumps(payload), delay_seconds=0,
         )
 
-    # --- Celery Beat Scheduling ---
+    # --- Monitoring Self-Healing and Legacy Cleanup ---
 
-    def _register_celery_health_check(self) -> None:
-        """Register periodic health check with Celery beat (runs every 5 minutes)"""
-        try:
-            task_name = f"youtubearr_{self._plugin_key}_health_check"
-            create_or_update_periodic_task(
-                task_name=task_name,
-                celery_task_path="core.tasks.check_plugin_health",
-                kwargs={"plugin_key": self._plugin_key},
-                cron_expression="*/5 * * * *",  # Every 5 minutes
-                enabled=True,
-            )
-            self._log(f"Registered Celery beat health check: {task_name}")
-        except Exception as exc:
-            self._log_error(f"Failed to register Celery health check: {exc}")
+    def _cleanup_legacy_celery_task(self) -> None:
+        """Delete the bogus Celery beat task registered by older plugin versions.
 
-    def _unregister_celery_health_check(self) -> None:
-        """Unregister periodic health check from Celery beat"""
+        Older versions registered a periodic task pointing at a Dispatcharr core task
+        that does not exist, causing Celery to spam 'Received unregistered task' errors
+        every 5 minutes. This method is idempotent (runs once per Plugin instance) and
+        safe to call from any action handler.
+        """
+        if self._legacy_task_cleanup_done:
+            return
+        self._legacy_task_cleanup_done = True
         try:
             task_name = f"youtubearr_{self._plugin_key}_health_check"
             deleted = delete_periodic_task(task_name)
             if deleted:
-                self._log(f"Unregistered Celery beat health check: {task_name}")
+                self._log(f"Removed legacy Celery beat task: {task_name}")
         except Exception as exc:
-            self._log_error(f"Failed to unregister Celery health check: {exc}")
+            self._log_error(f"Legacy Celery task cleanup failed: {exc}")
+
+    def _ensure_monitoring_thread(self, settings: Dict[str, Any]) -> bool:
+        """Restart the monitor thread if DB says active but no live thread is running.
+
+        This is the in-plugin self-healing path: it handles container restarts and
+        crashed/hung threads without relying on any Celery task. Returns True if a
+        new thread was started.
+        """
+        if not settings.get("monitoring_active"):
+            return False
+
+        thread_dead = not self._monitor_thread or not self._monitor_thread.is_alive()
+        if not thread_dead:
+            return False
+
+        # Another Celery worker's thread may still be running — check the shared heartbeat
+        heartbeat_str = settings.get("monitoring_heartbeat")
+        if heartbeat_str:
+            try:
+                heartbeat = datetime.fromisoformat(heartbeat_str.replace("Z", "+00:00"))
+                if isinstance(heartbeat.tzinfo, type(None)):
+                    heartbeat = heartbeat.replace(tzinfo=dt_timezone.utc)
+                age_seconds = (datetime.now(dt_timezone.utc) - heartbeat).total_seconds()
+                poll_interval_minutes = settings.get("poll_interval_minutes", 15)
+                heartbeat_threshold = (poll_interval_minutes + 10) * 60
+                if age_seconds < heartbeat_threshold:
+                    self._log(f"Monitoring heartbeat is recent ({int(age_seconds)}s ago, threshold={heartbeat_threshold}s), skipping auto-restart")
+                    return False
+            except (ValueError, TypeError):
+                pass
+
+        channels = settings.get("monitored_channels", "").strip()
+        if not channels or not self._ytdlp_path:
+            return False
+
+        self._log("Auto-restarting monitoring after service restart")
+        self._monitoring_active = True
+        self._monitor_stop_event.clear()
+        self._monitor_thread = threading.Thread(
+            target=self._monitoring_loop,
+            args=(self._plugin_key,),
+            daemon=True,
+            name="YouTubearr-Monitor"
+        )
+        self._monitor_thread.start()
+        return True
 
     def _log(self, message: str) -> None:
         """Write log message"""
