@@ -38,17 +38,29 @@ esac
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# Portable python runner: tries python3, then python, then nix-shell fallback.
+run_python() {
+  if command -v python3 &>/dev/null; then
+    python3 "$@"
+  elif command -v python &>/dev/null; then
+    python "$@"
+  elif command -v nix-shell &>/dev/null; then
+    nix-shell -p python3 --run "python3 $*"
+  else
+    echo "ERROR: No Python interpreter found (tried python3, python, nix-shell)" >&2
+    exit 1
+  fi
+}
+
 run_tests() {
   echo "Running unit tests..."
   cd "$SCRIPT_DIR"
-  nix-shell -p python3 --run "python3 -m unittest discover tests/ -v -p 'test_plugin.py'" 2>/dev/null \
-    || python -m unittest discover tests/ -v -p "test_plugin.py"
+  run_python -m unittest discover tests/ -v -p "test_plugin.py"
   echo "Unit tests passed."
 
   if $RUN_INTEGRATION; then
     echo "Running integration tests (requires internet + real yt-dlp, ~60s)..."
-    nix-shell -p python3 --run "python3 -m unittest tests/test_integration.py -v" 2>/dev/null \
-      || python -m unittest tests/test_integration.py -v
+    run_python -m unittest tests/test_integration.py -v
     echo "Integration tests passed."
   fi
 }
@@ -95,15 +107,29 @@ case "$TARGET" in
     ;;
 
   publish)
-    VERSION=$(nix-shell -p python3 --run "python3 -c \"import json; print(json.load(open('$SCRIPT_DIR/plugin.json'))['version'])\"" 2>/dev/null \
-              || python -c "import json; print(json.load(open('$SCRIPT_DIR/plugin.json'))['version'])")
-    PLUGINS_DIR="/home/gooch/dispatcharr-plugins"
+    VERSION=$(run_python -c "import json; print(json.load(open('$SCRIPT_DIR/plugin.json'))['version'])")
+    PLUGINS_DIR="${DISPATCHARR_PLUGINS_DIR:-$HOME/dispatcharr-plugins}"
     BRANCH="youtubearr/v${VERSION}"
 
     echo "Publishing v${VERSION} to dispatcharr/Plugins..."
 
-    cd "$PLUGINS_DIR"
-    git fetch upstream
+    # Clone plugins directory if missing
+    if [ ! -d "$PLUGINS_DIR" ]; then
+      echo "Plugins directory not found at $PLUGINS_DIR — attempting clone..."
+      if command -v git &>/dev/null; then
+        git clone https://github.com/jeff-gooch/Plugins.git "$PLUGINS_DIR"
+        cd "$PLUGINS_DIR"
+        git remote add upstream https://github.com/Dispatcharr/Plugins.git
+        git fetch upstream
+      else
+        echo "ERROR: $PLUGINS_DIR does not exist and git is not available to clone it."
+        exit 1
+      fi
+    else
+      cd "$PLUGINS_DIR"
+      git fetch upstream
+    fi
+
     git checkout main
     git merge upstream/main --ff-only
     git push origin main
@@ -124,13 +150,27 @@ case "$TARGET" in
     git push origin "$BRANCH"
 
     echo "Creating PR on dispatcharr/Plugins..."
-    nix-shell -p gh --run "gh pr create \
-      --repo Dispatcharr/Plugins \
-      --head jeff-gooch:${BRANCH} \
-      --base main \
-      --title '[youtubearr] Bump version to ${VERSION}' \
-      --body 'Bumps YouTubearr to v${VERSION}. See https://github.com/jeff-gooch/youtubearr/releases/tag/v${VERSION} for changelog.'" \
-    || echo "PR may already exist — check https://github.com/Dispatcharr/Plugins/pulls"
+    # Prefer gh on PATH over nix-shell fallback
+    if command -v gh &>/dev/null; then
+      gh pr create \
+        --repo Dispatcharr/Plugins \
+        --head jeff-gooch:${BRANCH} \
+        --base main \
+        --title "[youtubearr] Bump version to ${VERSION}" \
+        --body "Bumps YouTubearr to v${VERSION}. See https://github.com/jeff-gooch/youtubearr/releases/tag/v${VERSION} for changelog." \
+      || echo "PR may already exist — check https://github.com/Dispatcharr/Plugins/pulls"
+    elif command -v nix-shell &>/dev/null; then
+      nix-shell -p gh --run "gh pr create \
+        --repo Dispatcharr/Plugins \
+        --head jeff-gooch:${BRANCH} \
+        --base main \
+        --title '[youtubearr] Bump version to ${VERSION}' \
+        --body 'Bumps YouTubearr to v${VERSION}. See https://github.com/jeff-gooch/youtubearr/releases/tag/v${VERSION} for changelog.'" \
+      || echo "PR may already exist — check https://github.com/Dispatcharr/Plugins/pulls"
+    else
+      echo "ERROR: gh CLI not available — cannot create PR."
+      exit 1
+    fi
     ;;
 
   setup-test)
