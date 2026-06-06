@@ -1,5 +1,33 @@
 # YouTubearr Changelog
 
+## [1.20.0] - 2026-06-05
+
+### Added
+
+- **Diagnostics action**: New "Diagnostics" button runs a non-destructive health check and reports plugin state — yt-dlp/QuickJS binary detection, monitoring status, tracked stream counts, EPG source config, webhook config, extraction failure cache state, and any detected issues.
+
+- **Generic media refresh webhook**: Replaces the Jellyfin-specific webhook with a configurable endpoint (`media_refresh_webhook_url`). When new-style settings are used the plugin sends a structured JSON event body; the legacy `webhook_url` field continues to work as a plain bodyless POST (backward-compatible). Optional per-request delay, HTTP method, and header overrides are supported.
+
+- **Generic notification webhook**: Replaces the Telegram-specific notification with a configurable endpoint (`notification_webhook_url`) and base URL (`notification_base_url`). The payload is a generic JSON object suitable for routing to Telegram, Discord, Home Assistant, or any webhook bridge. The legacy `telegram_webhook_url` and `dispatcharr_base_url` fields remain fully supported as aliases.
+
+- **YouTubearr ownership metadata**: Streams and program data created by the plugin are now stamped with `owner: "youtubearr"` in `custom_properties`. This makes plugin-managed records identifiable for future tooling without touching channel or EPG source models.
+
+- **Custom M3U account association**: Streams are now associated with Dispatcharr's built-in custom M3U account at creation time, ensuring compatibility with the current Dispatcharr stream model.
+
+### Fixed
+
+- **Decimal display suffix bug**: Channel display names for decimal sub-channels like `.11`, `.21`, `.31` were showing the wrong suffix (e.g., `#1` instead of `#11`). The suffix is now extracted via string-safe subchannel parsing instead of float math, so channel names correctly show `#11`, `#21`, `#31`, etc.
+
+- **Extraction failure cache is now bounded**: Stale entries older than their TTL are pruned each monitoring cycle. Previously the cache could grow unboundedly over long uptimes.
+
+### Changed
+
+- **Webhook calls are fully non-blocking**: Both media refresh and notification webhooks now fire in short-lived daemon threads. The monitoring loop and manual Refresh action return immediately regardless of webhook delay or remote latency.
+
+### Internal
+
+- Test suite significantly expanded: unit tests now cover webhook resolution, ownership tag stamping, M3U account association, diagnostics, extraction failure pruning, and decimal slot allocation edge cases.
+
 ## [1.19.0] - 2026-05-17
 
 ### Fixed - Title filter now applied before Phase 2 (VirtualRailfan / many-streams fix)
