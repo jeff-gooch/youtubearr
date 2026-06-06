@@ -1,5 +1,44 @@
 # YouTubearr Changelog
 
+## [1.20.2] - 2026-06-06
+
+### Fixed
+
+- **Auto-start after restart/upgrade**: If `monitoring_active=True` was saved before a Dispatcharr restart or plugin upgrade, monitoring now resumes automatically when any action is dispatched (e.g., status check). No manual Refresh or Start click required.
+
+- **Start/Refresh race closed**: Rapid back-to-back Refresh + Start clicks (or simultaneous actions across multiple Dispatcharr workers) no longer launch duplicate monitoring threads. A new `monitoring_starting_at` lease field is written atomically under `select_for_update()` before the thread is started. Any concurrent worker that reads a fresh `monitoring_starting_at` returns "already starting" instead of launching its own thread.
+
+- **First heartbeat written immediately**: The monitoring thread now writes `monitoring_heartbeat` and clears `monitoring_starting_at` at the very top of its run, before entering the poll loop. This closes the window between claiming ownership and the first poll-loop heartbeat update.
+
+- **Start after Refresh/bootstrap correctly says already active**: Once monitoring is started (lease written or thread running), a subsequent Start action correctly returns "Monitoring already active" or "Monitoring already starting" instead of starting a second thread and returning "Monitoring started".
+
+- **Reset All clears lease fields**: `monitoring_heartbeat` and `monitoring_starting_at` are now cleared by Reset All alongside `monitoring_active`, so a subsequent Start always gets a clean slate.
+
+### Internal
+
+- Added `_is_starting_recent(settings)` helper (60-second freshness window for the `monitoring_starting_at` lease).
+- Added `_try_claim_monitor()` helper that performs the atomic `select_for_update()` claim and returns `"claimed"`, `"already_running"`, or `"already_starting"`.
+- `_ensure_monitoring_thread` and `_handle_start_monitoring` both check `_is_starting_recent` and delegate to `_try_claim_monitor` before starting any thread.
+- Diagnostics now surfaces `monitoring_starting_at` alongside `monitoring_heartbeat`.
+- New unit tests covering: fresh `monitoring_starting_at` prevents duplicate start, Refresh returns "starting" when lease is fresh, Start after restart/bootstrap says already active, Stop clears lease fields, and `_is_starting_recent` edge cases.
+
+## [1.20.1] - 2026-06-06
+
+### Fixed
+
+- **Webhook UI simplified**: The settings panel now shows only the four essential webhook fields (`Media Refresh Webhook URL`, `Media Refresh Webhook Delay`, `Notification Webhook URL`, `Notification Base URL`). Advanced fields (`headers`, `body_template`) and all legacy alias fields (`webhook_url`, `webhook_delay_seconds`, `telegram_webhook_url`, `dispatcharr_base_url`) are no longer visible in the UI. Existing saved values for those fields are still honored internally — no migration needed.
+
+- **Refresh now self-heals dead monitoring**: Clicking "Refresh Now" when monitoring is marked active but the thread has died (e.g., after a container restart with a stale heartbeat) now restarts monitoring and reports `Monitoring was marked active but was not running; restarted monitoring.` Previously it always returned "no refresh needed" without checking thread or heartbeat health.
+
+- **Refresh reports truthful status**: When monitoring is genuinely active, "Refresh Now" returns the poll interval, last poll time, and last heartbeat timestamp instead of a generic "no refresh needed" string.
+
+- **Start Monitoring self-heals stale state**: If `monitoring_active=True` but both the local thread is dead and the heartbeat is stale/missing, "Start Monitoring" now restarts instead of returning `Monitoring already active`. It returns "already active" only when a thread is alive or the heartbeat is demonstrably fresh.
+
+### Internal
+
+- Added `_is_heartbeat_recent(settings)` helper to centralize heartbeat staleness checks. `_ensure_monitoring_thread` and both action handlers now use this helper instead of duplicating the threshold calculation.
+- New unit tests covering: visible webhook fields, hidden legacy IDs, Refresh behavior under all monitoring states, and Start Monitoring behavior under all monitoring states.
+
 ## [1.20.0] - 2026-06-05
 
 ### Added

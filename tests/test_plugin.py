@@ -1473,5 +1473,772 @@ class TestRefreshExpiringUrls(unittest.TestCase):
         p._persist_settings.assert_not_called()
 
 
+# ── Webhook UI: visible fields / hidden legacy IDs ──────────────────────────
+
+class TestWebhookFieldVisibility(unittest.TestCase):
+    """Only the four canonical webhook fields should be visible in the settings UI."""
+
+    EXPECTED_WEBHOOK_IDS = {
+        "media_refresh_webhook_url",
+        "media_refresh_webhook_delay_seconds",
+        "notification_webhook_url",
+        "notification_base_url",
+    }
+    HIDDEN_LEGACY_IDS = {
+        "webhook_url",
+        "webhook_delay_seconds",
+        "telegram_webhook_url",
+        "dispatcharr_base_url",
+        "info_legacy_webhooks",
+    }
+    HIDDEN_ADVANCED_IDS = {
+        "media_refresh_webhook_headers",
+        "media_refresh_webhook_body_template",
+        "notification_webhook_headers",
+        "info_generic_webhooks",
+    }
+
+    def _field_ids(self):
+        return {f["id"] for f in Plugin.fields}
+
+    def test_all_four_webhook_fields_present(self):
+        ids = self._field_ids()
+        for fid in self.EXPECTED_WEBHOOK_IDS:
+            self.assertIn(fid, ids, f"Expected webhook field '{fid}' missing from Plugin.fields")
+
+    def test_legacy_ids_not_in_fields(self):
+        ids = self._field_ids()
+        for fid in self.HIDDEN_LEGACY_IDS:
+            self.assertNotIn(fid, ids, f"Legacy field '{fid}' must not be visible in Plugin.fields")
+
+    def test_advanced_ids_not_in_fields(self):
+        ids = self._field_ids()
+        for fid in self.HIDDEN_ADVANCED_IDS:
+            self.assertNotIn(fid, ids, f"Advanced field '{fid}' must not be visible in Plugin.fields")
+
+    def test_legacy_resolvers_still_work_with_legacy_settings(self):
+        p = _make_plugin()
+        config = p._get_media_refresh_webhook_config({"webhook_url": "http://legacy/r"})
+        self.assertEqual(config["url"], "http://legacy/r")
+        self.assertTrue(config["is_legacy"])
+
+    def test_new_generic_takes_precedence_over_legacy(self):
+        p = _make_plugin()
+        config = p._get_media_refresh_webhook_config({
+            "webhook_url": "http://legacy/r",
+            "media_refresh_webhook_url": "http://new/r",
+        })
+        self.assertEqual(config["url"], "http://new/r")
+        self.assertFalse(config["is_legacy"])
+
+    def test_notification_legacy_still_works(self):
+        p = _make_plugin()
+        config = p._get_notification_webhook_config({"telegram_webhook_url": "http://t.me/h"})
+        self.assertEqual(config["url"], "http://t.me/h")
+        self.assertTrue(config["is_legacy"])
+
+    def test_notification_new_takes_precedence(self):
+        p = _make_plugin()
+        config = p._get_notification_webhook_config({
+            "telegram_webhook_url": "http://t.me/h",
+            "notification_webhook_url": "http://new/h",
+        })
+        self.assertEqual(config["url"], "http://new/h")
+        self.assertFalse(config["is_legacy"])
+
+
+# ── _is_heartbeat_recent ────────────────────────────────────────────────────
+
+class TestIsHeartbeatRecent(unittest.TestCase):
+    from datetime import datetime, timezone as _tz, timedelta as _td
+
+    def _p(self):
+        return _make_plugin()
+
+    def test_recent_heartbeat_returns_true(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._p()
+        hb = datetime.now(dt_timezone.utc).isoformat()
+        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": hb, "poll_interval_minutes": 15}))
+
+    def test_stale_heartbeat_returns_false(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        self.assertFalse(p._is_heartbeat_recent({"monitoring_heartbeat": stale, "poll_interval_minutes": 15}))
+
+    def test_no_heartbeat_returns_false(self):
+        self.assertFalse(self._p()._is_heartbeat_recent({}))
+
+    def test_none_heartbeat_returns_false(self):
+        self.assertFalse(self._p()._is_heartbeat_recent({"monitoring_heartbeat": None}))
+
+    def test_malformed_heartbeat_returns_false(self):
+        self.assertFalse(self._p()._is_heartbeat_recent({"monitoring_heartbeat": "not-a-date"}))
+
+    def test_threshold_uses_poll_interval(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        # 9 minutes ago — within the default 15+10=25 min threshold
+        recent_ish = (datetime.now(dt_timezone.utc) - timedelta(minutes=9)).isoformat()
+        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": recent_ish, "poll_interval_minutes": 5}))
+
+
+# ── _handle_refresh behavior ─────────────────────────────────────────────────
+
+def _make_refresh_plugin():
+    p = _make_plugin()
+    p._plugin_key = "youtubearr"
+    p._monitor_thread = None
+    p._monitoring_active = False
+    p._monitor_stop_event = MagicMock()
+    p._manual_refresh_lock = MagicMock()
+    p._manual_refresh_lock.acquire.return_value = True
+    p._manual_refresh_lock.release = MagicMock()
+    return p
+
+
+def _mock_cfg(settings):
+    """Return a mock PluginConfig whose .settings returns the given dict."""
+    mock_cfg_obj = MagicMock()
+    mock_cfg_obj.settings = settings
+    mock_db = MagicMock()
+    mock_db.DoesNotExist = type("DoesNotExist", (Exception,), {})
+    mock_db.objects.get.return_value = mock_cfg_obj
+    return mock_db
+
+
+class TestHandleRefreshBehavior(unittest.TestCase):
+
+    def test_active_with_alive_thread_returns_status_not_refresh(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = _make_refresh_plugin()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
+                    "last_poll_time": datetime.now(dt_timezone.utc).isoformat()}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        self.assertIn("active", result["message"].lower())
+        self.assertNotIn("restart", result["message"].lower())
+
+    def test_active_with_recent_heartbeat_returns_status_not_refresh(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = _make_refresh_plugin()
+        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
+                    "monitoring_heartbeat": recent_hb,
+                    "last_poll_time": recent_hb}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        self.assertIn("active", result["message"].lower())
+
+    def test_active_with_recent_heartbeat_does_not_start_thread(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = _make_refresh_plugin()
+        p._ensure_monitoring_thread = MagicMock(return_value=False)
+        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
+                    "monitoring_heartbeat": recent_hb}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            p._handle_refresh({"settings": settings})
+        p._ensure_monitoring_thread.assert_not_called()
+
+    def test_active_stale_heartbeat_dead_thread_restarts_monitoring(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = _make_refresh_plugin()
+        p._ensure_monitoring_thread = MagicMock(return_value=True)
+        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
+                    "monitoring_heartbeat": stale}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        p._ensure_monitoring_thread.assert_called_once()
+        self.assertIn("restart", result["message"].lower())
+
+    def test_active_no_heartbeat_dead_thread_restarts_monitoring(self):
+        p = _make_refresh_plugin()
+        p._ensure_monitoring_thread = MagicMock(return_value=True)
+        settings = {"monitoring_active": True, "poll_interval_minutes": 15}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        p._ensure_monitoring_thread.assert_called_once()
+        self.assertIn("restart", result["message"].lower())
+
+    def test_inactive_runs_background_one_shot(self):
+        p = _make_refresh_plugin()
+        settings = {"monitoring_active": False}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_refresh({"settings": settings})
+        mock_t.start.assert_called_once()
+        self.assertIn("background", result["message"].lower())
+
+    def test_status_message_includes_poll_interval(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = _make_refresh_plugin()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        settings = {"monitoring_active": True, "poll_interval_minutes": 20}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        self.assertIn("20", result["message"])
+
+
+# ── _handle_start_monitoring behavior ───────────────────────────────────────
+
+class TestHandleStartMonitoringBehavior(unittest.TestCase):
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._monitor_stop_event = MagicMock()
+        p._legacy_task_cleanup_done = False
+        p._persist_settings = MagicMock()
+        return p
+
+    def test_active_with_thread_alive_returns_already_active(self):
+        p = self._make_p()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "running")
+        self.assertIn("already active", result["message"].lower())
+
+    def test_active_with_recent_heartbeat_returns_already_active(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa",
+                    "monitoring_heartbeat": recent_hb, "poll_interval_minutes": 15}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "running")
+        self.assertIn("already active", result["message"].lower())
+
+    def test_active_stale_heartbeat_dead_thread_starts_monitoring(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa",
+                    "monitoring_heartbeat": stale, "poll_interval_minutes": 15}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_start_monitoring({"settings": settings})
+        mock_t.start.assert_called_once()
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("already active", result["message"].lower())
+
+    def test_active_no_heartbeat_dead_thread_starts_monitoring(self):
+        p = self._make_p()
+        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_start_monitoring({"settings": settings})
+        mock_t.start.assert_called_once()
+        self.assertNotIn("already active", result["message"].lower())
+
+    def test_inactive_with_channels_starts_monitoring(self):
+        p = self._make_p()
+        settings = {"monitoring_active": False, "monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_start_monitoring({"settings": settings})
+        mock_t.start.assert_called_once()
+        self.assertEqual(result["status"], "running")
+
+
+# ── _cleanup_ended_streams ───────────────────────────────────────────────────
+
+class TestCleanupEndedStreams(unittest.TestCase):
+    """Regression tests for _cleanup_ended_streams."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._persist_settings = MagicMock()
+        return p
+
+    def _make_channel_cls(self, channel=None, missing=False):
+        """Return a mock Channel class whose objects.get behaves appropriately."""
+        mock_cls = MagicMock()
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        mock_cls.DoesNotExist = DoesNotExist
+        if missing:
+            mock_cls.objects.get.side_effect = DoesNotExist
+        else:
+            mock_cls.objects.get.return_value = channel or MagicMock()
+        return mock_cls
+
+    def test_orphaned_entry_removed_and_persisted_with_no_channel_deletion(self):
+        """Orphaned is_live=True entry (channel missing) is removed and settings persisted."""
+        p = self._make_p()
+        settings = {
+            "auto_cleanup": True,
+            "tracked_streams": {
+                "orphan_vid": {"is_live": True, "channel_id": 999, "stream_id": None, "title": "Gone"},
+            },
+        }
+        mock_channel_cls = self._make_channel_cls(missing=True)
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.Stream", MagicMock()), \
+             patch("plugin.ProgramData", MagicMock()):
+            count = p._cleanup_ended_streams(settings)
+        # No channel was deleted (channel was already missing)
+        self.assertEqual(count, 0)
+        # Tracking entry was removed
+        self.assertNotIn("orphan_vid", settings["tracked_streams"])
+        # Settings persisted even though cleaned_count == 0
+        p._persist_settings.assert_called_once()
+
+    def test_orphaned_entry_no_channel_id_removed_and_persisted(self):
+        """Orphaned is_live=True entry with no channel_id is removed and settings persisted."""
+        p = self._make_p()
+        settings = {
+            "auto_cleanup": True,
+            "tracked_streams": {
+                "no_cid_vid": {"is_live": True, "channel_id": None, "stream_id": None, "title": "NoID"},
+            },
+        }
+        with patch("plugin.Channel", MagicMock()), \
+             patch("plugin.Stream", MagicMock()), \
+             patch("plugin.ProgramData", MagicMock()):
+            count = p._cleanup_ended_streams(settings)
+        self.assertEqual(count, 0)
+        self.assertNotIn("no_cid_vid", settings["tracked_streams"])
+        p._persist_settings.assert_called_once()
+
+    def test_stale_live_entry_deleted_when_epg_ended_and_verify_returns_false(self):
+        """is_live=True entry with expired EPG is deleted when verify says not live."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        p._verify_video_is_live = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.epg_data = MagicMock()
+
+        # Programme whose end_time is one hour in the past
+        past_time = datetime.now(dt_timezone.utc) - timedelta(hours=1)
+        mock_prog = MagicMock()
+        mock_prog.end_time = past_time
+
+        mock_program_data = MagicMock()
+        mock_program_data.objects.filter.return_value.first.return_value = mock_prog
+
+        mock_channel_cls = self._make_channel_cls(channel=mock_channel)
+        mock_stream_cls = MagicMock()
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        mock_stream_cls.DoesNotExist = DoesNotExist
+        mock_stream_cls.objects.get.side_effect = DoesNotExist  # stream already gone
+
+        settings = {
+            "auto_cleanup": True,
+            "tracked_streams": {
+                "stale_vid": {
+                    "is_live": True, "channel_id": 100, "stream_id": 200, "title": "Stale Stream"
+                },
+            },
+        }
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.Stream", mock_stream_cls), \
+             patch("plugin.ProgramData", mock_program_data), \
+             patch("plugin.timezone") as mock_tz:
+            mock_tz.now.return_value = datetime.now(dt_timezone.utc)
+            count = p._cleanup_ended_streams(settings)
+
+        self.assertEqual(count, 1)
+        mock_channel.delete.assert_called_once()
+        self.assertNotIn("stale_vid", settings["tracked_streams"])
+        p._persist_settings.assert_called_once()
+        p._verify_video_is_live.assert_called_once_with("stale_vid")
+
+    def test_stale_live_entry_kept_when_epg_ended_but_verify_returns_true(self):
+        """is_live=True entry with expired EPG is NOT deleted when verify says still live."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        p._verify_video_is_live = MagicMock(return_value=True)
+
+        mock_channel = MagicMock()
+        mock_channel.epg_data = MagicMock()
+
+        past_time = datetime.now(dt_timezone.utc) - timedelta(hours=1)
+        mock_prog = MagicMock()
+        mock_prog.end_time = past_time
+
+        mock_program_data = MagicMock()
+        mock_program_data.objects.filter.return_value.first.return_value = mock_prog
+
+        mock_channel_cls = self._make_channel_cls(channel=mock_channel)
+
+        settings = {
+            "auto_cleanup": True,
+            "tracked_streams": {
+                "still_live_vid": {
+                    "is_live": True, "channel_id": 101, "stream_id": 201, "title": "Still Live"
+                },
+            },
+        }
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.Stream", MagicMock()), \
+             patch("plugin.ProgramData", mock_program_data), \
+             patch("plugin.timezone") as mock_tz:
+            mock_tz.now.return_value = datetime.now(dt_timezone.utc)
+            count = p._cleanup_ended_streams(settings)
+
+        self.assertEqual(count, 0)
+        mock_channel.delete.assert_not_called()
+        self.assertIn("still_live_vid", settings["tracked_streams"])
+        # Settings not persisted — no entries removed
+        p._persist_settings.assert_not_called()
+        p._verify_video_is_live.assert_called_once_with("still_live_vid")
+
+    def test_live_entry_with_fresh_epg_not_verified_or_deleted(self):
+        """is_live=True entry whose EPG end_time is in the future is left alone."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        p._verify_video_is_live = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.epg_data = MagicMock()
+
+        future_time = datetime.now(dt_timezone.utc) + timedelta(hours=6)
+        mock_prog = MagicMock()
+        mock_prog.end_time = future_time
+
+        mock_program_data = MagicMock()
+        mock_program_data.objects.filter.return_value.first.return_value = mock_prog
+
+        mock_channel_cls = self._make_channel_cls(channel=mock_channel)
+
+        settings = {
+            "auto_cleanup": True,
+            "tracked_streams": {
+                "fresh_vid": {
+                    "is_live": True, "channel_id": 102, "stream_id": 202, "title": "Fresh"
+                },
+            },
+        }
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.Stream", MagicMock()), \
+             patch("plugin.ProgramData", mock_program_data), \
+             patch("plugin.timezone") as mock_tz:
+            mock_tz.now.return_value = datetime.now(dt_timezone.utc)
+            count = p._cleanup_ended_streams(settings)
+
+        self.assertEqual(count, 0)
+        mock_channel.delete.assert_not_called()
+        self.assertIn("fresh_vid", settings["tracked_streams"])
+        p._persist_settings.assert_not_called()
+        # verify should NOT have been called — EPG still current
+        p._verify_video_is_live.assert_not_called()
+
+
+# ── _handle_diagnostics: orphaned and stale-EPG warnings ────────────────────
+
+class TestDiagnosticsOrphanedAndStaleEPG(unittest.TestCase):
+    """Diagnostics surfaces orphaned tracked entries and stale-EPG warnings."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._legacy_task_cleanup_done = False
+        p._log_path = MagicMock()
+        p._log_path.exists.return_value = False
+        p._base_dir = MagicMock()
+        p._get_ytdlp_version = MagicMock(return_value="2025.01.01")
+        p._get_qjs_version = MagicMock(return_value="not configured")
+        return p
+
+    def _make_channel_cls(self, channel=None, missing=False):
+        mock_cls = MagicMock()
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        mock_cls.DoesNotExist = DoesNotExist
+        if missing:
+            mock_cls.objects.get.side_effect = DoesNotExist
+        else:
+            mock_cls.objects.get.return_value = channel or MagicMock()
+        return mock_cls
+
+    def test_orphaned_count_reported_and_warns(self):
+        """Diagnostics reports orphaned tracked entries and emits a warning."""
+        p = self._make_p()
+        settings = {
+            "tracked_streams": {
+                "orphan1": {"is_live": True, "channel_id": 999},
+            }
+        }
+        mock_channel_cls = self._make_channel_cls(missing=True)
+        mock_pd = MagicMock()
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", mock_pd):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["orphaned_tracked_count"], 1)
+        self.assertIn(result["status"], ("warning", "error"))
+
+    def test_stale_epg_count_reported_and_warns(self):
+        """Diagnostics counts is_live=True entries with expired EPG and warns."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+
+        mock_channel = MagicMock()
+        mock_channel.epg_data = MagicMock()
+
+        past_time = datetime.now(dt_timezone.utc) - timedelta(hours=2)
+        mock_prog = MagicMock()
+        mock_prog.end_time = past_time
+
+        mock_pd = MagicMock()
+        mock_pd.objects.filter.return_value.first.return_value = mock_prog
+
+        mock_channel_cls = self._make_channel_cls(channel=mock_channel)
+
+        settings = {
+            "tracked_streams": {
+                "stale1": {"is_live": True, "channel_id": 100},
+            }
+        }
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", mock_pd):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"]["stale_epg_tracked_count"], 1)
+        self.assertIn(result["status"], ("warning", "error"))
+
+    def test_zero_counts_when_all_live_and_epg_current(self):
+        """No warnings when live tracked entries have current EPG."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+
+        mock_channel = MagicMock()
+        mock_channel.epg_data = MagicMock()
+
+        future_time = datetime.now(dt_timezone.utc) + timedelta(hours=10)
+        mock_prog = MagicMock()
+        mock_prog.end_time = future_time
+
+        mock_pd = MagicMock()
+        mock_pd.objects.filter.return_value.first.return_value = mock_prog
+
+        mock_channel_cls = self._make_channel_cls(channel=mock_channel)
+
+        settings = {
+            "tracked_streams": {
+                "fresh1": {"is_live": True, "channel_id": 101},
+            }
+        }
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", mock_pd):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"].get("orphaned_tracked_count", 0), 0)
+        self.assertEqual(result["details"].get("stale_epg_tracked_count", 0), 0)
+
+    def test_zero_counts_when_no_tracked_streams(self):
+        """No orphan/stale warnings when tracked_streams is empty."""
+        p = self._make_p()
+        settings = {"tracked_streams": {}}
+        with patch("plugin.Channel", MagicMock()), \
+             patch("plugin.ProgramData", MagicMock()):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"].get("orphaned_tracked_count", 0), 0)
+        self.assertEqual(result["details"].get("stale_epg_tracked_count", 0), 0)
+
+    def test_not_live_entries_excluded_from_orphan_check(self):
+        """Entries with is_live=False are skipped — only live entries are checked for orphans."""
+        p = self._make_p()
+        settings = {
+            "tracked_streams": {
+                "ended_vid": {"is_live": False, "channel_id": 500},
+            }
+        }
+        mock_channel_cls = self._make_channel_cls(missing=True)
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", MagicMock()):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertEqual(result["details"].get("orphaned_tracked_count", 0), 0)
+
+
+# ── v1.20.2: auto-start + start/refresh race fix ────────────────────────────
+
+class TestAutoStartAndRaceFix(unittest.TestCase):
+    """Tests for v1.20.2 auto-start and duplicate-monitor prevention."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._monitor_stop_event = MagicMock()
+        p._legacy_task_cleanup_done = False
+        p._persist_settings = MagicMock()
+        return p
+
+    # ── _is_starting_recent ──────────────────────────────────────────────────
+
+    def test_is_starting_recent_with_fresh_timestamp(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        fresh = datetime.now(dt_timezone.utc).isoformat()
+        self.assertTrue(p._is_starting_recent({"monitoring_starting_at": fresh}))
+
+    def test_is_starting_recent_with_stale_timestamp(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale = (datetime.now(dt_timezone.utc) - timedelta(seconds=120)).isoformat()
+        self.assertFalse(p._is_starting_recent({"monitoring_starting_at": stale}))
+
+    def test_is_starting_recent_with_no_field(self):
+        self.assertFalse(self._make_p()._is_starting_recent({}))
+
+    def test_is_starting_recent_with_none_field(self):
+        self.assertFalse(self._make_p()._is_starting_recent({"monitoring_starting_at": None}))
+
+    def test_is_starting_recent_with_malformed_timestamp(self):
+        self.assertFalse(self._make_p()._is_starting_recent({"monitoring_starting_at": "not-a-date"}))
+
+    # ── bootstrap: monitoring_active=True + stale hb + no thread → one start ─
+
+    def test_bootstrap_starts_monitor_once_when_active_and_thread_dead(self):
+        """monitoring_active=True + dead thread + stale hb → ensure_monitoring_thread starts exactly one thread."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": stale_hb,
+            "poll_interval_minutes": 15,
+        }
+        with patch("threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            started = p._ensure_monitoring_thread(settings)
+        self.assertTrue(started)
+        self.assertEqual(mock_t.start.call_count, 1)
+
+    def test_bootstrap_does_not_start_when_starting_at_fresh(self):
+        """monitoring_active=True + fresh monitoring_starting_at → ensure_monitoring_thread skips."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_start = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": stale_hb,
+            "monitoring_starting_at": fresh_start,
+            "poll_interval_minutes": 15,
+        }
+        with patch("threading.Thread") as mock_thread:
+            started = p._ensure_monitoring_thread(settings)
+        self.assertFalse(started)
+        mock_thread.assert_not_called()
+
+    # ── handle_start_monitoring: fresh starting_at → already starting ─────────
+
+    def test_start_monitoring_returns_already_starting_when_starting_at_fresh(self):
+        """Start returns 'already starting' when another worker holds the lease."""
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        fresh_start = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_starting_at": fresh_start,
+            "poll_interval_minutes": 15,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "running")
+        self.assertIn("starting", result["message"].lower())
+
+    def test_start_after_refresh_returns_already_active_when_heartbeat_fresh(self):
+        """Start after refresh/bootstrap sees fresh heartbeat and returns already active."""
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": fresh_hb,
+            "poll_interval_minutes": 15,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "running")
+        self.assertIn("already active", result["message"].lower())
+
+    # ── handle_refresh: fresh starting_at → returns starting not manual poll ──
+
+    def test_refresh_returns_starting_message_when_monitor_just_claimed(self):
+        """Refresh with stale hb but fresh monitoring_starting_at returns 'starting' not one-shot poll."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = _make_refresh_plugin()
+        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        fresh_start = datetime.now(dt_timezone.utc).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": stale_hb,
+            "monitoring_starting_at": fresh_start,
+            "poll_interval_minutes": 15,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            result = p._handle_refresh({"settings": settings})
+        # Should NOT start a manual one-shot thread
+        mock_thread.assert_not_called()
+        self.assertIn("starting", result["message"].lower())
+
+    # ── handle_stop_monitoring clears starting_at ─────────────────────────────
+
+    def test_stop_clears_monitoring_starting_at(self):
+        """Stop persists monitoring_starting_at=None so Start can work cleanly after."""
+        p = self._make_p()
+        p._monitoring_active = True
+        p._persist_settings = MagicMock()
+        context = {"settings": {"monitoring_active": True, "monitoring_starting_at": "2026-06-06T12:00:00+00:00"}}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._handle_stop_monitoring(context)
+        persisted = p._persist_settings.call_args[0][0]
+        self.assertIn("monitoring_starting_at", persisted)
+        self.assertIsNone(persisted["monitoring_starting_at"])
+
+    def test_stop_clears_heartbeat(self):
+        """Stop also persists monitoring_heartbeat=None."""
+        p = self._make_p()
+        p._monitoring_active = True
+        p._persist_settings = MagicMock()
+        context = {"settings": {"monitoring_active": True}}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._handle_stop_monitoring(context)
+        persisted = p._persist_settings.call_args[0][0]
+        self.assertIn("monitoring_heartbeat", persisted)
+        self.assertIsNone(persisted["monitoring_heartbeat"])
+
+    # ── version ──────────────────────────────────────────────────────────────
+
+    def test_version_is_1_20_2(self):
+        self.assertEqual(Plugin.version, "1.20.2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

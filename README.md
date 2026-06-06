@@ -82,10 +82,10 @@ Triggers an external endpoint whenever channels are added or removed. Use this t
 |---------|-------------|
 | `media_refresh_webhook_url` | URL to POST when channels change. Leave empty to disable. |
 | `media_refresh_webhook_delay_seconds` | Delay before sending (default: 5s). Allows Dispatcharr to finish processing first. |
-| `media_refresh_webhook_headers` | Optional JSON object of extra request headers (e.g., `{"Authorization": "Bearer TOKEN"}`). |
-| `media_refresh_webhook_body_template` | Optional static JSON body to send. Leave empty to use the default event payload. |
 
 **Legacy alias**: The old `webhook_url` field continues to work as a plain bodyless POST (Jellyfin-style). Set `media_refresh_webhook_url` to migrate to the generic form.
+
+**Advanced/compatibility fields** (not shown in UI — set via API or direct DB edit if needed): `media_refresh_webhook_headers` (JSON object of extra request headers), `media_refresh_webhook_body_template` (static JSON body; leave unset to use the default event payload).
 
 #### Notification Webhook
 
@@ -95,9 +95,10 @@ Sends a JSON event notification when a new stream is added. Works with any HTTP 
 |---------|-------------|
 | `notification_webhook_url` | URL to POST new-stream notifications. Leave empty to disable. |
 | `notification_base_url` | Base URL for Dispatcharr stream links in the payload (e.g., `https://tv.example.com`). |
-| `notification_webhook_headers` | Optional JSON object of extra request headers. |
 
 **Legacy aliases**: The old `telegram_webhook_url` and `dispatcharr_base_url` fields continue to work unchanged. Set `notification_webhook_url` / `notification_base_url` to migrate.
+
+**Advanced/compatibility field** (not shown in UI): `notification_webhook_headers` (JSON object of extra request headers).
 
 ## Notifications and Webhooks
 
