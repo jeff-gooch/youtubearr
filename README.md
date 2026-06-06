@@ -14,8 +14,9 @@ YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestream
 - **Title Filtering**: Regex filters for channels with many simultaneous streams
 - **Quality Selection**: Choose preferred stream quality (Best, 1080p, 720p, 480p)
 - **Channel Profiles**: Automatically add new channels to a Dispatcharr channel profile
-- **Notifications**: Telegram webhook notifications when new streams are added
-- **Jellyfin Integration**: Webhook trigger to refresh Jellyfin guide data automatically
+- **Media Refresh Webhook**: Trigger an external endpoint (e.g., Jellyfin guide refresh) when channels are added or removed
+- **Notification Webhook**: Generic webhook notification when new streams go live — works with Telegram, Discord, Home Assistant, or any webhook bridge
+- **Diagnostics**: Built-in health check action to verify plugin state and configuration
 - **Zero Dependencies**: Bundled yt-dlp binary, no pip installs required
 
 ## Installation
@@ -65,20 +66,98 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
   - **Decimal** (default): Groups streams by YouTube channel (90.1, 90.2, 90.3)
   - **Sequential**: Simple whole numbers (2000, 2001, 2002) for IPTV players that don't handle decimals
 - **Starting Channel Number**: First channel number to assign (default: 2000)
-  - Example: Set to 3000 to start YouTube streams at channel 3000
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
-  - Example: Set to 10 to assign channels 2000, 2010, 2020, etc.
 - **YouTube Cookies**: Paste cookies in Netscape format for authenticated access
-  - Used as fallback when stream extraction fails
-  - Helps with age-restricted or region-locked content
-  - Export from browser using a cookies extension (e.g., "Get cookies.txt LOCALLY")
 - **Channel Profile**: Optional Dispatcharr channel profile to automatically add new channels to
-- **EPG Source Name**: Name of the EPG source for guide data (default: "YouTube Live")
-- **Webhook URL**: URL to POST when channels are added or removed (e.g., Jellyfin refresh endpoint)
-- **Webhook Delay**: Seconds to wait before triggering the webhook (default: 5)
-- **Telegram Webhook URL**: URL to POST for Telegram notifications when new streams go live
+- **EPG Source Name**: Name of the EPG source for guide data (default: "YouTube Live"). Supports `{title}` and `{channel}` placeholders.
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
-- **Dispatcharr Base URL**: Base URL for stream links in notifications (e.g., https://tv.example.com)
+
+### Webhook Settings
+
+#### Media Refresh Webhook
+
+Triggers an external endpoint whenever channels are added or removed. Use this to automatically refresh Jellyfin, Emby, Plex, or any guide consumer.
+
+| Setting | Description |
+|---------|-------------|
+| `media_refresh_webhook_url` | URL to POST when channels change. Leave empty to disable. |
+| `media_refresh_webhook_delay_seconds` | Delay before sending (default: 5s). Allows Dispatcharr to finish processing first. |
+| `media_refresh_webhook_headers` | Optional JSON object of extra request headers (e.g., `{"Authorization": "Bearer TOKEN"}`). |
+| `media_refresh_webhook_body_template` | Optional static JSON body to send. Leave empty to use the default event payload. |
+
+**Legacy alias**: The old `webhook_url` field continues to work as a plain bodyless POST (Jellyfin-style). Set `media_refresh_webhook_url` to migrate to the generic form.
+
+#### Notification Webhook
+
+Sends a JSON event notification when a new stream is added. Works with any HTTP endpoint — Telegram bot bridges, Discord webhooks, Home Assistant, n8n, etc.
+
+| Setting | Description |
+|---------|-------------|
+| `notification_webhook_url` | URL to POST new-stream notifications. Leave empty to disable. |
+| `notification_base_url` | Base URL for Dispatcharr stream links in the payload (e.g., `https://tv.example.com`). |
+| `notification_webhook_headers` | Optional JSON object of extra request headers. |
+
+**Legacy aliases**: The old `telegram_webhook_url` and `dispatcharr_base_url` fields continue to work unchanged. Set `notification_webhook_url` / `notification_base_url` to migrate.
+
+## Notifications and Webhooks
+
+YouTubearr supports two independent webhook types that serve different purposes.
+
+### Media Refresh Webhook
+
+Fires after channels are added or removed. Intended to tell your media server to refresh its guide.
+
+**Default event payload** (when `media_refresh_webhook_url` is set without a body template):
+```json
+{
+  "event": "media_refresh_requested",
+  "plugin": "youtubearr",
+  "reason": "streams_changed",
+  "timestamp": "2026-06-05T12:00:00+00:00"
+}
+```
+
+**Jellyfin example** (bodyless POST — use the legacy `webhook_url` field or a body template):
+```
+http://jellyfin:8096/ScheduledTasks/Running/TASK_ID?api_key=YOUR_API_KEY
+```
+
+### Notification Webhook
+
+Fires when a new stream is added (monitoring or manual). Delivers stream metadata to whatever endpoint you configure.
+
+**Event payload** (`notification_webhook_url`):
+```json
+{
+  "event": "stream_added",
+  "plugin": "youtubearr",
+  "video_id": "abc123defgh",
+  "title": "🔴 LIVE - Stream Title",
+  "channel_name": "YouTube Channel Name",
+  "channel_number": "90.1",
+  "dispatcharr_channel_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "url": "https://tv.example.com/proxy/ts/stream/UUID",
+  "thumbnail": "https://i.ytimg.com/vi/abc123defgh/hqdefault_live.jpg",
+  "timestamp": "2026-06-05T12:00:00+00:00"
+}
+```
+
+**Legacy payload** (`telegram_webhook_url`): The old Telegram-specific field preserves the original key shape for compatibility:
+```json
+{
+  "title": "🔴 LIVE - Stream Title",
+  "channel": "YouTube Channel Name",
+  "url": "https://tv.example.com/proxy/ts/stream/UUID",
+  "description": "Added as Dispatcharr Channel #90.1",
+  "timestamp": "2026-06-05T12:00:00+00:00"
+}
+```
+
+Route the generic payload to a Telegram bot bridge, Discord webhook, Home Assistant webhook automation, or any HTTP-capable service.
+
+### Best-effort delivery
+
+Both webhooks are **best-effort**: failures are logged to `youtubearr.log` but do not block stream creation, monitoring, or the Refresh action. Webhook calls run in background threads, so configured delays never stall the caller.
 
 ## EPG Setup
 
@@ -100,26 +179,15 @@ Then set the same name in YouTubearr's **EPG Source Name** setting.
 
 **Note:** The Dummy EPG source acts as a container for YouTubearr's programme data. The plugin creates `ProgramData` entries directly with the livestream title, bypassing the Dummy EPG's pattern-based generation.
 
-### Step 2: Refresh the Guide in Jellyfin
+### Step 2: Refresh the Guide
 
-After YouTubearr adds new channels, Jellyfin needs to refresh its guide data to display them.
-
-#### Manual Refresh
-
-1. Open Jellyfin and go to **Dashboard → Scheduled Tasks**
-2. Find **Refresh Guide** in the task list
-3. Click the **Play** button to run it immediately
+After YouTubearr adds new channels, your media server needs to refresh its guide data.
 
 #### Automatic Refresh (Recommended)
 
-Set up a scheduled refresh so new YouTube channels appear automatically:
+Set the **Media Refresh Webhook URL** in YouTubearr settings to your media server's refresh endpoint. The plugin will trigger it automatically whenever channels change.
 
-1. Go to **Dashboard → Scheduled Tasks → Refresh Guide**
-2. Click on the task to edit its schedule
-3. Set it to run every few hours (e.g., every 4 hours) or at specific times
-4. Click **Save**
-
-**Tip:** YouTubearr can trigger a Jellyfin webhook when channels are added. Set the **Webhook URL** in YouTubearr settings to:
+**Jellyfin example:**
 ```
 http://jellyfin:8096/ScheduledTasks/Running/TASK_ID?api_key=YOUR_API_KEY
 ```
@@ -129,6 +197,12 @@ To find your Refresh Guide task ID:
 curl "http://jellyfin:8096/ScheduledTasks?api_key=YOUR_API_KEY" | grep -A2 "RefreshGuide"
 ```
 
+#### Manual Refresh
+
+1. Open Jellyfin and go to **Dashboard → Scheduled Tasks**
+2. Find **Refresh Guide** in the task list
+3. Click the **Play** button to run it immediately
+
 ## Usage
 
 ### Adding a Stream Manually
@@ -136,7 +210,7 @@ curl "http://jellyfin:8096/ScheduledTasks?api_key=YOUR_API_KEY" | grep -A2 "Refr
 1. Copy a YouTube livestream URL (e.g., `https://www.youtube.com/watch?v=VIDEO_ID`)
 2. Open YouTubearr plugin settings in Dispatcharr
 3. Paste the URL into the **Manual YouTube URL** field
-4. Click the **Add Stream** button
+4. Click the **Add Streams** button
 5. The stream will appear as a new channel in your Dispatcharr feed
 
 ### Monitoring YouTube Channels
@@ -152,12 +226,13 @@ curl "http://jellyfin:8096/ScheduledTasks?api_key=YOUR_API_KEY" | grep -A2 "Refr
 
 ### Manual Actions
 
-- **Add Stream**: Add a single stream from the Manual URL field
+- **Add Streams**: Add one or more streams from the Manual URL field
 - **Start Monitoring**: Begin automatic monitoring of configured channels
 - **Stop Monitoring**: Stop automatic monitoring
 - **Refresh Now**: Immediately check for new/ended livestreams (bypasses poll interval)
 - **Cleanup**: Manually remove all channels for ended streams
 - **Reset All**: Remove all YouTubearr channels and clear all plugin state
+- **Diagnostics**: Run a non-destructive health check — reports binary detection, monitoring status, webhook configuration, EPG state, and any detected issues
 
 ## Channel Numbering
 
@@ -255,6 +330,7 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - Verify the YouTube stream is actually live (not a premiere or scheduled stream)
 - Check the youtubearr.log file for error messages
 - Try adding the stream manually first to verify yt-dlp is working
+- Run the **Diagnostics** action to check binary detection and plugin state
 
 ### Stream playback issues
 
@@ -267,6 +343,12 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - Use the **Cleanup** action to remove channels for ended streams
 - This can happen if monitoring was stopped while streams were active
 
+### Webhook not firing
+
+- Run **Diagnostics** — it reports whether each webhook is configured and flags malformed header JSON
+- Check `youtubearr.log` for `[media_refresh]` or `[notification]` entries
+- Both webhooks are best-effort; failures are logged and do not block stream creation
+
 ## Technical Details
 
 - **yt-dlp**: Used for all YouTube interactions (stream detection, URL extraction, metadata)
@@ -277,6 +359,11 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - **Cookies Fallback**: Optional cookie authentication with automatic retry on extraction failure
 - **Thread Safety**: Uses Django's select_for_update() to prevent race conditions
 - **Auto-Recovery**: Monitoring automatically resumes after container/service restarts
+- **Ownership Tags**: Streams and program data are stamped with `owner: "youtubearr"` in custom properties
+
+## Scope
+
+YouTubearr is focused on YouTube livestreams. Twitch support is intentionally out of scope for this plugin — it belongs in a dedicated project (Twitcharr) to keep each plugin simple and purpose-built.
 
 ## Logs
 
@@ -289,7 +376,7 @@ tail -f /app/data/plugins/youtubearr/youtubearr.log
 
 ## Support
 
-- GitHub Issues: https://github.com/jeff-gooch/Youtubearr/issues
+- GitHub Issues: https://github.com/jeff-gooch/youtubearr/issues
 - Dispatcharr Discord: https://discord.gg/dispatcharr
 
 ## License
