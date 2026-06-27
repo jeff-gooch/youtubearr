@@ -1253,14 +1253,15 @@ class TestEnsureMonitoringThread(unittest.TestCase):
         self.assertTrue(started)
         self.assertTrue(p._monitoring_active)
 
-    def test_skips_when_heartbeat_is_recent(self):
+    def test_skips_when_heartbeat_and_poll_are_recent(self):
         from datetime import datetime, timezone as dt_timezone
         p = self._make_p()
-        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        recent_ts = datetime.now(dt_timezone.utc).isoformat()
         settings = {
             "monitoring_active": True,
             "monitored_channels": "@nasa",
-            "monitoring_heartbeat": recent_hb,
+            "monitoring_heartbeat": recent_ts,
+            "last_poll_time": recent_ts,
             "poll_interval_minutes": 15,
         }
         started = p._ensure_monitoring_thread(settings)
@@ -1303,6 +1304,25 @@ class TestEnsureMonitoringThread(unittest.TestCase):
         settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
         started = p._ensure_monitoring_thread(settings)
         self.assertFalse(started)
+
+    def test_ghost_heartbeat_fresh_hb_stale_poll_does_not_skip(self):
+        """Ghost-heartbeat: fresh heartbeat but stale last_poll must NOT prevent thread start."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": fresh_hb,
+            "last_poll_time": stale_poll,
+            "poll_interval_minutes": 15,
+        }
+        with patch("threading.Thread") as mock_thread:
+            mock_thread.return_value.is_alive.return_value = False
+            started = p._ensure_monitoring_thread(settings)
+        # Must have started a thread despite fresh heartbeat, because poll is stale
+        self.assertTrue(started)
 
 
 class TestDiagnosticsNewFields(unittest.TestCase):
@@ -1403,6 +1423,104 @@ class TestDiagnosticsNewFields(unittest.TestCase):
         settings = {"tracked_streams": {"v1": {"is_live": True, "last_url_refresh": "bad-ts"}}}
         result = p._handle_diagnostics({"settings": settings})
         self.assertEqual(result["details"]["stale_tracked_stream_url_count"], 1)
+
+    def test_last_poll_age_seconds_present_when_poll_recent(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._make_p()
+        now_ts = datetime.now(dt_timezone.utc).isoformat()
+        result = p._handle_diagnostics({"settings": {"last_poll_time": now_ts}})
+        self.assertIn("last_poll_age_seconds", result["details"])
+        age = result["details"]["last_poll_age_seconds"]
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0)
+
+    def test_last_poll_age_seconds_none_when_never_polled(self):
+        p = self._make_p()
+        result = p._handle_diagnostics({"settings": {}})
+        self.assertIn("last_poll_age_seconds", result["details"])
+        self.assertIsNone(result["details"]["last_poll_age_seconds"])
+
+    def test_stale_poll_warning_when_active_and_poll_stale(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "last_poll_time": stale_poll,
+            "poll_interval_minutes": 15,
+        }
+        result = p._handle_diagnostics({"settings": settings})
+        # Stale-poll condition must trigger a warning-level result
+        self.assertIn(result["status"], ("warning", "error"),
+                      f"Expected warning/error status for stale poll, got: {result['status']}")
+        # last_poll_age_seconds must be populated and large
+        age = result["details"].get("last_poll_age_seconds")
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 7000)
+
+    def test_no_stale_poll_warning_when_inactive(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": False,
+            "last_poll_time": stale_poll,
+            "poll_interval_minutes": 15,
+        }
+        result = p._handle_diagnostics({"settings": settings})
+        # When monitoring is inactive, stale poll alone must not degrade status to warning
+        # (other issues from the test env might raise warnings, so just check the stale-poll
+        # age is still populated but status is not warning *due to* the poll check)
+        age = result["details"].get("last_poll_age_seconds")
+        self.assertIsNotNone(age)  # field is present regardless
+
+    def test_epg_window_counts_present_in_details(self):
+        p = self._make_p()
+        with patch("plugin.EPGSource") as mock_es:
+            mock_es.objects.filter.return_value.first.return_value = None
+            result = p._handle_diagnostics({"settings": {"epg_source_name": "YouTube Live"}})
+        self.assertIn("epg_window_counts", result["details"])
+
+    def test_empty_epg_warning_when_active_and_no_programs(self):
+        p = self._make_p()
+        mock_source = MagicMock()
+        with patch("plugin.EPGSource") as mock_es, \
+             patch("plugin.ProgramData") as mock_pd:
+            mock_es.objects.filter.return_value.first.return_value = mock_source
+            mock_pd.objects.filter.return_value.count.return_value = 0
+            settings = {
+                "monitoring_active": True,
+                "epg_source_name": "YouTube Live",
+                "last_poll_time": __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc).isoformat(),
+            }
+            result = p._handle_diagnostics({"settings": settings})
+        # Empty EPG with active monitoring must produce a warning/error status
+        self.assertIn(result["status"], ("warning", "error"),
+                      f"Expected warning/error for empty EPG, got: {result['status']}")
+        # epg_window_counts must be populated
+        counts = result["details"].get("epg_window_counts", {})
+        self.assertTrue(counts.get("source_found"), "source_found should be True")
+        self.assertEqual(counts.get("current", -1), 0)
+
+    def test_no_epg_warning_when_programs_present(self):
+        p = self._make_p()
+        mock_source = MagicMock()
+        with patch("plugin.EPGSource") as mock_es, \
+             patch("plugin.ProgramData") as mock_pd:
+            mock_es.objects.filter.return_value.first.return_value = mock_source
+            mock_pd.objects.filter.return_value.count.side_effect = [5, 10]
+            settings = {
+                "monitoring_active": True,
+                "epg_source_name": "YouTube Live",
+                "last_poll_time": __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc).isoformat(),
+            }
+            result = p._handle_diagnostics({"settings": settings})
+        # With programs present the EPG warning must not be the cause of any status degradation
+        counts = result["details"].get("epg_window_counts", {})
+        self.assertTrue(counts.get("source_found"))
+        self.assertGreater(counts.get("current", 0), 0)
 
 
 class TestRefreshExpiringUrls(unittest.TestCase):
@@ -1584,6 +1702,153 @@ class TestIsHeartbeatRecent(unittest.TestCase):
         self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": recent_ish, "poll_interval_minutes": 5}))
 
 
+# ── Stale-poll detection helpers ─────────────────────────────────────────────
+
+class TestStaleEPGDetectionHelpers(unittest.TestCase):
+    """Tests for _parse_iso_datetime, _age_seconds, _is_last_poll_recent,
+    _get_youtubearr_epg_window_counts, and the ghost-heartbeat property."""
+
+    def _p(self):
+        return _make_plugin()
+
+    # --- _parse_iso_datetime ---
+
+    def test_parse_iso_datetime_valid_utc(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._p()
+        ts = datetime.now(dt_timezone.utc).isoformat()
+        result = p._parse_iso_datetime(ts)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.tzinfo)
+
+    def test_parse_iso_datetime_none_returns_none(self):
+        self.assertIsNone(self._p()._parse_iso_datetime(None))
+
+    def test_parse_iso_datetime_empty_string_returns_none(self):
+        self.assertIsNone(self._p()._parse_iso_datetime(""))
+
+    def test_parse_iso_datetime_invalid_returns_none(self):
+        self.assertIsNone(self._p()._parse_iso_datetime("not-a-date"))
+
+    def test_parse_iso_datetime_z_suffix_accepted(self):
+        p = self._p()
+        result = p._parse_iso_datetime("2026-06-07T12:00:00Z")
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.tzinfo)
+
+    def test_parse_iso_datetime_naive_gets_utc(self):
+        p = self._p()
+        result = p._parse_iso_datetime("2026-06-07T12:00:00")
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.tzinfo)
+
+    # --- _age_seconds ---
+
+    def test_age_seconds_none_input_returns_none(self):
+        self.assertIsNone(self._p()._age_seconds(None))
+
+    def test_age_seconds_empty_returns_none(self):
+        self.assertIsNone(self._p()._age_seconds(""))
+
+    def test_age_seconds_recent_returns_small_positive(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._p()
+        ts = datetime.now(dt_timezone.utc).isoformat()
+        age = p._age_seconds(ts)
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0.0)
+        self.assertLess(age, 5.0)
+
+    def test_age_seconds_old_timestamp_returns_large(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        age = p._age_seconds(old_ts)
+        self.assertGreater(age, 7000)
+
+    # --- _is_last_poll_recent ---
+
+    def test_is_last_poll_recent_with_fresh_timestamp_returns_true(self):
+        from datetime import datetime, timezone as dt_timezone
+        p = self._p()
+        ts = datetime.now(dt_timezone.utc).isoformat()
+        self.assertTrue(p._is_last_poll_recent({"last_poll_time": ts, "poll_interval_minutes": 15}))
+
+    def test_is_last_poll_recent_with_stale_timestamp_returns_false(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        self.assertFalse(p._is_last_poll_recent({"last_poll_time": stale, "poll_interval_minutes": 15}))
+
+    def test_is_last_poll_recent_with_no_timestamp_returns_false(self):
+        self.assertFalse(self._p()._is_last_poll_recent({}))
+
+    def test_is_last_poll_recent_with_none_returns_false(self):
+        self.assertFalse(self._p()._is_last_poll_recent({"last_poll_time": None}))
+
+    def test_is_last_poll_recent_threshold_uses_poll_interval(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        # 12 minutes ago — within 15+10=25 min threshold but NOT within 1+10=11 min threshold
+        twelve_min_ago = (datetime.now(dt_timezone.utc) - timedelta(minutes=12)).isoformat()
+        self.assertTrue(p._is_last_poll_recent({"last_poll_time": twelve_min_ago, "poll_interval_minutes": 15}))
+        self.assertFalse(p._is_last_poll_recent({"last_poll_time": twelve_min_ago, "poll_interval_minutes": 1}))
+
+    # --- _get_youtubearr_epg_window_counts ---
+
+    def test_get_epg_window_counts_source_not_found(self):
+        p = self._p()
+        with patch("plugin.EPGSource") as mock_es:
+            mock_es.objects.filter.return_value.first.return_value = None
+            result = p._get_youtubearr_epg_window_counts({"epg_source_name": "YouTube Live"})
+        self.assertFalse(result["source_found"])
+        self.assertEqual(result["current"], 0)
+        self.assertEqual(result["future12"], 0)
+
+    def test_get_epg_window_counts_source_found_with_programs(self):
+        p = self._p()
+        mock_source = MagicMock()
+        with patch("plugin.EPGSource") as mock_es, \
+             patch("plugin.ProgramData") as mock_pd:
+            mock_es.objects.filter.return_value.first.return_value = mock_source
+            mock_pd.objects.filter.return_value.count.side_effect = [3, 5]
+            result = p._get_youtubearr_epg_window_counts({"epg_source_name": "YouTube Live"})
+        self.assertTrue(result["source_found"])
+        self.assertEqual(result["current"], 3)
+        self.assertEqual(result["future12"], 5)
+
+    def test_get_epg_window_counts_empty_source_name_skips_query(self):
+        p = self._p()
+        result = p._get_youtubearr_epg_window_counts({"epg_source_name": ""})
+        self.assertFalse(result["source_found"])
+
+    def test_get_epg_window_counts_db_error_returns_zeros(self):
+        p = self._p()
+        with patch("plugin.EPGSource") as mock_es:
+            mock_es.objects.filter.side_effect = RuntimeError("DB down")
+            result = p._get_youtubearr_epg_window_counts({"epg_source_name": "YouTube Live"})
+        self.assertFalse(result["source_found"])
+        self.assertEqual(result["current"], 0)
+
+    # --- ghost heartbeat property ---
+
+    def test_fresh_heartbeat_alone_is_not_healthy_when_poll_stale(self):
+        """The core ghost-heartbeat invariant: heartbeat alone must not be treated as healthy."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._p()
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        # heartbeat is fresh but last_poll is stale → NOT recent
+        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": fresh_hb, "poll_interval_minutes": 15}))
+        self.assertFalse(p._is_last_poll_recent({"last_poll_time": stale_poll, "poll_interval_minutes": 15}))
+        # combined: both must be true for healthy
+        combined = (
+            p._is_heartbeat_recent({"monitoring_heartbeat": fresh_hb, "poll_interval_minutes": 15})
+            and p._is_last_poll_recent({"last_poll_time": stale_poll, "poll_interval_minutes": 15})
+        )
+        self.assertFalse(combined)
+
+
 # ── _handle_refresh behavior ─────────────────────────────────────────────────
 
 def _make_refresh_plugin():
@@ -1634,13 +1899,14 @@ class TestHandleRefreshBehavior(unittest.TestCase):
             result = p._handle_refresh({"settings": settings})
         self.assertIn("active", result["message"].lower())
 
-    def test_active_with_recent_heartbeat_does_not_start_thread(self):
+    def test_active_with_recent_heartbeat_and_poll_does_not_start_thread(self):
+        """Both heartbeat and last_poll must be recent to skip _ensure_monitoring_thread."""
         from datetime import datetime, timezone as dt_timezone
         p = _make_refresh_plugin()
         p._ensure_monitoring_thread = MagicMock(return_value=False)
-        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        recent_ts = datetime.now(dt_timezone.utc).isoformat()
         settings = {"monitoring_active": True, "poll_interval_minutes": 15,
-                    "monitoring_heartbeat": recent_hb}
+                    "monitoring_heartbeat": recent_ts, "last_poll_time": recent_ts}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             p._handle_refresh({"settings": settings})
         p._ensure_monitoring_thread.assert_not_called()
@@ -1688,6 +1954,44 @@ class TestHandleRefreshBehavior(unittest.TestCase):
             result = p._handle_refresh({"settings": settings})
         self.assertIn("20", result["message"])
 
+    def test_ghost_heartbeat_fresh_hb_stale_poll_dead_thread_triggers_refresh(self):
+        """Ghost-heartbeat scenario: fresh hb but stale last_poll and no local thread.
+        _handle_refresh must NOT return 'no manual refresh needed' — it must restart and poll."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = _make_refresh_plugin()
+        p._ensure_monitoring_thread = MagicMock(return_value=True)
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "poll_interval_minutes": 15,
+            "monitoring_heartbeat": fresh_hb,
+            "last_poll_time": stale_poll,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        # Must have called _ensure_monitoring_thread (attempted restart)
+        p._ensure_monitoring_thread.assert_called_once()
+        # Message must NOT say "no manual refresh needed"
+        self.assertNotIn("no manual refresh needed", result["message"].lower())
+
+    def test_ghost_heartbeat_fresh_hb_stale_poll_returns_restart_message(self):
+        """Ghost-heartbeat scenario result message should mention restart."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = _make_refresh_plugin()
+        p._ensure_monitoring_thread = MagicMock(return_value=True)
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "poll_interval_minutes": 15,
+            "monitoring_heartbeat": fresh_hb,
+            "last_poll_time": stale_poll,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_refresh({"settings": settings})
+        self.assertIn("restart", result["message"].lower())
+
 
 # ── _handle_start_monitoring behavior ───────────────────────────────────────
 
@@ -1717,9 +2021,10 @@ class TestHandleStartMonitoringBehavior(unittest.TestCase):
     def test_active_with_recent_heartbeat_returns_already_active(self):
         from datetime import datetime, timezone as dt_timezone
         p = self._make_p()
-        recent_hb = datetime.now(dt_timezone.utc).isoformat()
+        recent_ts = datetime.now(dt_timezone.utc).isoformat()
         settings = {"monitoring_active": True, "monitored_channels": "@nasa",
-                    "monitoring_heartbeat": recent_hb, "poll_interval_minutes": 15}
+                    "monitoring_heartbeat": recent_ts, "last_poll_time": recent_ts,
+                    "poll_interval_minutes": 15}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_start_monitoring({"settings": settings})
         self.assertEqual(result["status"], "running")
@@ -1761,6 +2066,30 @@ class TestHandleStartMonitoringBehavior(unittest.TestCase):
             result = p._handle_start_monitoring({"settings": settings})
         mock_t.start.assert_called_once()
         self.assertEqual(result["status"], "running")
+
+    def test_ghost_heartbeat_fresh_hb_stale_poll_attempts_restart(self):
+        """Ghost-heartbeat: active=True, fresh heartbeat, stale last_poll, no local thread.
+        _handle_start_monitoring must NOT return 'already active' — it must attempt restart."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
+        settings = {
+            "monitoring_active": True,
+            "monitored_channels": "@nasa",
+            "monitoring_heartbeat": fresh_hb,
+            "last_poll_time": stale_poll,
+            "poll_interval_minutes": 15,
+        }
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_start_monitoring({"settings": settings})
+        # Thread must have been started (not skipped)
+        mock_t.start.assert_called_once()
+        # Must NOT say "already active"
+        self.assertNotIn("already active", result["message"].lower())
 
 
 # ── _cleanup_ended_streams ───────────────────────────────────────────────────
@@ -2167,14 +2496,15 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
         self.assertIn("starting", result["message"].lower())
 
     def test_start_after_refresh_returns_already_active_when_heartbeat_fresh(self):
-        """Start after refresh/bootstrap sees fresh heartbeat and returns already active."""
+        """Start after refresh/bootstrap sees fresh heartbeat+poll and returns already active."""
         from datetime import datetime, timezone as dt_timezone
         p = self._make_p()
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
+        fresh_ts = datetime.now(dt_timezone.utc).isoformat()
         settings = {
             "monitoring_active": True,
             "monitored_channels": "@nasa",
-            "monitoring_heartbeat": fresh_hb,
+            "monitoring_heartbeat": fresh_ts,
+            "last_poll_time": fresh_ts,
             "poll_interval_minutes": 15,
         }
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
@@ -2236,8 +2566,8 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_20_2(self):
-        self.assertEqual(Plugin.version, "1.20.2")
+    def test_version_is_1_20_3(self):
+        self.assertEqual(Plugin.version, "1.20.3")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,24 @@
 # YouTubearr Changelog
 
+## [1.20.3] - 2026-06-07
+
+### Fixed
+
+- **Ghost heartbeat after restart no longer blocks EPG refresh**: When Dispatcharr restarts, the dying monitoring thread writes a final heartbeat just before exit. Previously this "ghost" heartbeat caused `_handle_refresh`, `_handle_start_monitoring`, `_try_claim_monitor`, and `_ensure_monitoring_thread` to treat the instance as healthy and skip restarting — leaving EPG data stale for up to 28 hours. All four now require **both** a recent heartbeat **and** a recent `last_poll_time` to consider monitoring healthy. A fresh heartbeat alone no longer suppresses a restart when the last poll is stale.
+
+- **Missing EPG ProgramData rows are now created**: `_refresh_epg_times` previously used `.update()` only, which silently did nothing if a channel's `ProgramData` row was absent. It now falls back to `update_or_create`, ensuring EPG entries are created for channels that lost their program rows (e.g., after a database migration or first-time setup).
+
+### Added
+
+- **`last_poll_age_seconds` in diagnostics**: The diagnostics action now reports the age of the last successful poll in seconds.
+- **Stale-poll warning in diagnostics**: When `monitoring_active=True` but `last_poll_time` is stale, diagnostics surfaces a `warning:monitoring active but last poll is stale` issue.
+- **EPG window counts in diagnostics**: `epg_window_counts` reports the number of current and next-12h programs in the YouTubearr EPG source, and warns when the source has no current or future programs while monitoring appears active.
+
+### Internal
+
+- Added `_parse_iso_datetime(value)`, `_age_seconds(value)`, `_is_last_poll_recent(settings)`, and `_get_youtubearr_epg_window_counts(settings)` helpers.
+- New unit tests covering: stale-poll detection helpers, fresh-heartbeat-alone not healthy, `_handle_refresh` and `_handle_start_monitoring` behavior with ghost heartbeat, `_ensure_monitoring_thread` heartbeat+poll combined guard, and diagnostics new fields.
+
 ## [1.20.2] - 2026-06-06
 
 ### Fixed

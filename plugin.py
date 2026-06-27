@@ -24,7 +24,7 @@ from core.scheduling import delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.20.2"
+    version = "1.20.3"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"
@@ -588,13 +588,13 @@ class Plugin:
             settings = context.get("settings", {})
 
         if settings.get("monitoring_active"):
-            if self._is_heartbeat_recent(settings):
-                self._log("Monitoring already active (fresh heartbeat from running worker)")
+            if self._is_heartbeat_recent(settings) and self._is_last_poll_recent(settings):
+                self._log("Monitoring already active (fresh heartbeat and recent poll from running worker)")
                 return {"status": "running", "message": "Monitoring already active"}
             if self._is_starting_recent(settings):
                 self._log("Monitoring already being claimed by another worker (fresh monitoring_starting_at)")
                 return {"status": "running", "message": "Monitoring already starting"}
-            self._log("monitoring_active=True but thread dead and heartbeat stale/missing — will restart")
+            self._log("monitoring_active=True but health stale (heartbeat or last_poll) — will restart")
 
         monitored = settings.get("monitored_channels", "").strip()
         if not monitored:
@@ -682,8 +682,13 @@ class Plugin:
         if settings.get("monitoring_active"):
             thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
             heartbeat_recent = self._is_heartbeat_recent(settings)
+            last_poll_recent = self._is_last_poll_recent(settings)
 
-            if thread_alive or heartbeat_recent:
+            # Local thread alive → trust it unconditionally (it's this worker's own thread).
+            # Another worker healthy (fresh heartbeat + fresh last_poll) → also safe to skip.
+            # Do NOT skip on heartbeat alone when local thread is dead and last_poll is stale:
+            # the heartbeat may be a ghost from the process that died at restart.
+            if thread_alive or (heartbeat_recent and last_poll_recent):
                 # Monitoring is genuinely running — return informative status, no duplicate poll needed.
                 poll_interval = settings.get("poll_interval_minutes", 15)
                 last_poll = settings.get("last_poll_time", "")
@@ -699,8 +704,8 @@ class Plugin:
                     ),
                 }
 
-            # monitoring_active=True but thread dead and heartbeat stale — check for a concurrent claim
-            # before trying to restart ourselves.
+            # monitoring_active=True but local thread dead and (heartbeat stale OR last_poll stale).
+            # Check for a concurrent claim before trying to restart ourselves.
             if self._is_starting_recent(settings):
                 return {
                     "status": "running",
@@ -712,8 +717,9 @@ class Plugin:
                     "status": "running",
                     "message": "Monitoring was marked active but was not running; restarted monitoring.",
                 }
-            # _ensure_monitoring_thread couldn't restart (no channels configured, etc.) — fall through
-            # to the one-shot manual refresh below.
+            # _ensure_monitoring_thread couldn't restart (no channels configured, another worker holds
+            # a fresh heartbeat, etc.) — fall through to the one-shot manual refresh below so EPG
+            # and stream state are still refreshed promptly.
 
         if not self._manual_refresh_lock.acquire(blocking=False):
             return {"status": "info", "message": "A manual refresh is already in progress — check logs for progress."}
@@ -878,6 +884,8 @@ class Plugin:
         thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
         details["monitor_thread_alive"] = thread_alive
         details["last_poll_time"] = settings.get("last_poll_time") or "unknown"
+        _lpa = self._age_seconds(settings.get("last_poll_time"))
+        details["last_poll_age_seconds"] = int(_lpa) if _lpa is not None else None
         details["monitoring_heartbeat"] = settings.get("monitoring_heartbeat") or "unknown"
         details["monitoring_starting_at"] = settings.get("monitoring_starting_at") or "unknown"
 
@@ -894,6 +902,18 @@ class Plugin:
                     issues.append("warning:monitoring active but heartbeat is unparseable")
             else:
                 issues.append("warning:monitoring active but no heartbeat found")
+
+        # Stale-poll warning — active but last_poll is beyond the expected cycle window
+        if monitoring_active_db and not self._is_last_poll_recent(settings):
+            _poll_age_str = f"{int(_lpa)}s" if _lpa is not None else "never"
+            issues.append(f"warning:monitoring active but last poll is stale (age={_poll_age_str})")
+
+        # EPG window counts — surface current/future program counts for the YouTubearr source
+        _epg_window = self._get_youtubearr_epg_window_counts(settings)
+        details["epg_window_counts"] = _epg_window
+        if monitoring_active_db and _epg_window.get("source_found"):
+            if _epg_window.get("current", 0) == 0 and _epg_window.get("future12", 0) == 0:
+                issues.append("warning:YouTubearr EPG source has no current or future programs — monitor may need refresh")
 
         # Monitored channels / tracked streams
         monitored_raw = settings.get("monitored_channels", "").strip()
@@ -2651,6 +2671,27 @@ class Plugin:
                     )
                     if updated > 0:
                         refreshed_count += 1
+                    else:
+                        # No ProgramData row exists — create one so the EPG window stays current.
+                        # This repairs channels whose program entry was deleted externally or
+                        # expired after a long monitoring outage.
+                        channel_tvg_id = channel.tvg_id or str(channel.channel_number)
+                        title = stream_data.get("title", "YouTube Live")
+                        try:
+                            ProgramData.objects.update_or_create(
+                                epg=channel.epg_data,
+                                tvg_id=channel_tvg_id,
+                                defaults={
+                                    "title": title,
+                                    "description": title,
+                                    "start_time": prog_now,
+                                    "end_time": prog_now + timedelta(hours=12),
+                                }
+                            )
+                            refreshed_count += 1
+                            self._log(f"Created missing EPG program for channel {channel_id} (tvg_id={channel_tvg_id})")
+                        except Exception as create_exc:
+                            self._log_error(f"Failed to create EPG program for channel {channel_id}: {create_exc}")
             except Channel.DoesNotExist:
                 pass
             except Exception as exc:
@@ -3317,6 +3358,64 @@ class Plugin:
         except (ValueError, TypeError):
             return False
 
+    def _parse_iso_datetime(self, value) -> Optional[datetime]:
+        """Parse an ISO-8601 datetime string safely. Returns None on any failure."""
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=dt_timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            return None
+
+    def _age_seconds(self, value) -> Optional[float]:
+        """Return age in seconds of an ISO-8601 timestamp, or None if unparseable."""
+        dt = self._parse_iso_datetime(value)
+        if dt is None:
+            return None
+        return max(0.0, (datetime.now(dt_timezone.utc) - dt).total_seconds())
+
+    def _is_last_poll_recent(self, settings: Dict[str, Any]) -> bool:
+        """Return True if last_poll_time is within (poll_interval + 10 min) — same grace as heartbeat."""
+        age = self._age_seconds(settings.get("last_poll_time"))
+        if age is None:
+            return False  # Never polled or unparseable
+        poll_interval_minutes = settings.get("poll_interval_minutes", 15)
+        threshold = (poll_interval_minutes + 10) * 60
+        return age < threshold
+
+    def _get_youtubearr_epg_window_counts(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Return current/future-12h program counts for the configured EPG source.
+
+        Safe fallback: returns zeros and source_found=False on any DB/import error.
+        """
+        result: Dict[str, Any] = {"current": 0, "future12": 0, "source_found": False}
+        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
+        if not epg_source_name:
+            return result
+        try:
+            source = EPGSource.objects.filter(name=epg_source_name).first()
+            if not source:
+                return result
+            result["source_found"] = True
+            now = datetime.now(dt_timezone.utc)
+            future12 = now + timedelta(hours=12)
+            result["current"] = ProgramData.objects.filter(
+                epg__epg_source=source,
+                start_time__lte=now,
+                end_time__gt=now,
+            ).count()
+            result["future12"] = ProgramData.objects.filter(
+                epg__epg_source=source,
+                end_time__gt=now,
+                start_time__lt=future12,
+            ).count()
+        except Exception:
+            pass
+        return result
+
     def _try_claim_monitor(self) -> str:
         """Atomically claim the monitor owner slot under a DB row lock.
 
@@ -3340,7 +3439,7 @@ class Plugin:
                 s = dict(cfg.settings or {})
 
                 if s.get("monitoring_active"):
-                    if self._is_heartbeat_recent(s):
+                    if self._is_heartbeat_recent(s) and self._is_last_poll_recent(s):
                         return "already_running"
                     if self._is_starting_recent(s):
                         return "already_starting"
@@ -3369,10 +3468,12 @@ class Plugin:
         if not thread_dead:
             return False
 
-        # Another worker's thread may still be running — check the shared heartbeat
-        if self._is_heartbeat_recent(settings):
+        # Another worker's thread may still be running — check the shared heartbeat AND last_poll.
+        # A fresh heartbeat alone is not sufficient: it may be a stale write from the process that
+        # died on the last container restart. Require both to be within threshold before skipping.
+        if self._is_heartbeat_recent(settings) and self._is_last_poll_recent(settings):
             heartbeat_str = settings.get("monitoring_heartbeat", "")
-            self._log(f"Monitoring heartbeat is recent (heartbeat={heartbeat_str[:19]}), skipping auto-restart")
+            self._log(f"Monitoring heartbeat and poll are recent (heartbeat={heartbeat_str[:19]}), skipping auto-restart")
             return False
 
         # Another worker may have just claimed the monitor slot (starting_at is fresh)
