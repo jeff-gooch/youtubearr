@@ -14,6 +14,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -42,6 +44,12 @@ def _make_plugin(qjs=False):
     p._extraction_failures = {}
     p._assigned_channel_numbers = set()
     p._channel_group_name = "YouTube Live"
+    # Prevent filesystem access in tests — override per-test when testing real behavior
+    p._read_runtime_state = MagicMock(return_value={})
+    p._write_runtime_state = MagicMock()
+    p._acquire_monitor_lock = MagicMock(return_value=True)
+    p._release_monitor_lock = MagicMock()
+    p._is_monitor_lock_held_by_other = MagicMock(return_value=False)
     return p
 
 
@@ -851,7 +859,8 @@ class TestDiagnostics(unittest.TestCase):
                       "last_poll_time", "tracked_stream_count", "extraction_failure_count",
                       "ytdlp_path", "ytdlp_version", "qjs_path", "qjs_version",
                       "cookies_configured", "cookies_file_present",
-                      "media_refresh_webhook_configured", "notification_webhook_configured"):
+                      "media_refresh_webhook_configured", "notification_webhook_configured",
+                      "log_path"):
             self.assertIn(field, d, f"missing field: {field}")
 
     # yt-dlp missing → error status
@@ -1112,6 +1121,161 @@ class TestGetRecentLogSummary(unittest.TestCase):
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    def test_warning_count_zero_when_no_warnings(self):
+        p = _make_plugin()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("INFO: all good\nERROR: something broke\n")
+            tmp_path = Path(f.name)
+        try:
+            p._log_path = tmp_path
+            result = p._get_recent_log_summary()
+            self.assertEqual(result["warning_count"], 0)
+            self.assertEqual(result["recent_warnings"], [])
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_warning_count_and_recent_warnings_populated(self):
+        p = _make_plugin()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("INFO: ok\nWARNING: url stale\nWARNING: heartbeat missing\nINFO: ok\n")
+            tmp_path = Path(f.name)
+        try:
+            p._log_path = tmp_path
+            result = p._get_recent_log_summary()
+            self.assertEqual(result["warning_count"], 2)
+            self.assertEqual(len(result["recent_warnings"]), 2)
+            self.assertTrue(any("stale" in w for w in result["recent_warnings"]))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_recent_warnings_capped_at_five(self):
+        p = _make_plugin()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            for i in range(10):
+                f.write(f"WARNING: warning number {i}\n")
+            tmp_path = Path(f.name)
+        try:
+            p._log_path = tmp_path
+            result = p._get_recent_log_summary()
+            self.assertEqual(result["warning_count"], 10)
+            self.assertLessEqual(len(result["recent_warnings"]), 5)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_recent_lines_populated_from_log(self):
+        p = _make_plugin()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            for i in range(25):
+                f.write(f"INFO: line {i}\n")
+            tmp_path = Path(f.name)
+        try:
+            p._log_path = tmp_path
+            result = p._get_recent_log_summary()
+            self.assertIn("recent_lines", result)
+            self.assertGreater(len(result["recent_lines"]), 0)
+            self.assertLessEqual(len(result["recent_lines"]), 20)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_recent_lines_empty_when_log_missing(self):
+        p = _make_plugin()
+        p._log_path = Path("/nonexistent/path/youtubearr.log")
+        result = p._get_recent_log_summary()
+        self.assertEqual(result["recent_lines"], [])
+        self.assertEqual(result["status"], "log file not found")
+
+    def test_recent_lines_does_not_contain_cookies_content(self):
+        """Log lines must never expose cookie content — plugin logs paths, not content."""
+        p = _make_plugin()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("INFO: Wrote cookies to /path/to/cookies.txt\n")
+            f.write("INFO: all good\n")
+            tmp_path = Path(f.name)
+        try:
+            p._log_path = tmp_path
+            result = p._get_recent_log_summary()
+            combined = " ".join(result["recent_lines"])
+            # Path is fine; raw cookie values must not appear
+            self.assertNotIn("domain\tFALSE", combined)
+            self.assertNotIn("secret-cookie-value", combined)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+
+class TestDiagnosticsNextActions(unittest.TestCase):
+    """next_actions hints appear in diagnostics details when issues are detected."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._legacy_task_cleanup_done = False
+        p._log_path = MagicMock()
+        p._log_path.exists.return_value = False
+        p._base_dir = MagicMock()
+        p._get_ytdlp_version = MagicMock(return_value="2025.01.01")
+        p._get_qjs_version = MagicMock(return_value="not configured")
+        return p
+
+    def test_no_next_actions_when_healthy(self):
+        p = self._make_p()
+        result = p._handle_diagnostics({"settings": {}})
+        # Healthy diagnostics should have no next_actions (or empty list)
+        self.assertNotIn("next_actions", result["details"])
+
+    def test_next_actions_present_when_ytdlp_missing(self):
+        p = self._make_p()
+        p._ytdlp_path = None
+        p._get_ytdlp_version = MagicMock(return_value="unavailable: yt-dlp not found")
+        result = p._handle_diagnostics({"settings": {}})
+        self.assertIn("next_actions", result["details"])
+        hints = result["details"]["next_actions"]
+        self.assertTrue(any("yt-dlp" in h.lower() for h in hints))
+
+    def test_next_actions_present_for_orphaned_tracked_entries(self):
+        p = self._make_p()
+        settings = {"tracked_streams": {"orphan1": {"is_live": True, "channel_id": 999}}}
+        mock_channel_cls = MagicMock()
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        mock_channel_cls.DoesNotExist = DoesNotExist
+        mock_channel_cls.objects.get.side_effect = DoesNotExist
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", MagicMock()):
+            result = p._handle_diagnostics({"settings": settings})
+        self.assertIn("next_actions", result["details"])
+        hints = result["details"]["next_actions"]
+        self.assertTrue(any("Cleanup" in h for h in hints))
+
+    def test_next_actions_deduplicated(self):
+        """Multiple issues with the same action should only appear once in next_actions."""
+        p = self._make_p()
+        # Two orphaned entries → should produce one "run Cleanup" hint, not two
+        settings = {
+            "tracked_streams": {
+                "orphan1": {"is_live": True, "channel_id": 998},
+                "orphan2": {"is_live": True, "channel_id": 999},
+            }
+        }
+        mock_channel_cls = MagicMock()
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+        mock_channel_cls.DoesNotExist = DoesNotExist
+        mock_channel_cls.objects.get.side_effect = DoesNotExist
+        with patch("plugin.Channel", mock_channel_cls), \
+             patch("plugin.ProgramData", MagicMock()):
+            result = p._handle_diagnostics({"settings": settings})
+        if "next_actions" in result["details"]:
+            hints = result["details"]["next_actions"]
+            cleanup_hints = [h for h in hints if "Cleanup" in h]
+            self.assertLessEqual(len(cleanup_hints), 1)
+
+    def test_log_path_in_diagnostics_details(self):
+        p = self._make_p()
+        result = p._handle_diagnostics({"settings": {}})
+        self.assertIn("log_path", result["details"])
+        self.assertIsInstance(result["details"]["log_path"], str)
+        self.assertGreater(len(result["details"]["log_path"]), 0)
+
 
 class TestCeleryCleanup(unittest.TestCase):
     """Legacy Celery beat task is removed and never re-registered."""
@@ -1227,7 +1391,7 @@ class TestCeleryCleanup(unittest.TestCase):
 
 
 class TestEnsureMonitoringThread(unittest.TestCase):
-    """_ensure_monitoring_thread self-heals without Celery."""
+    """_ensure_monitoring_thread self-heals using runtime_state + file lock."""
 
     def _make_p(self):
         p = _make_plugin()
@@ -1238,91 +1402,70 @@ class TestEnsureMonitoringThread(unittest.TestCase):
         p._legacy_task_cleanup_done = False
         return p
 
-    def test_returns_false_when_monitoring_inactive(self):
+    def test_returns_false_when_desired_inactive(self):
         p = self._make_p()
-        started = p._ensure_monitoring_thread({"monitoring_active": False})
+        p._read_runtime_state.return_value = {"desired_active": False}
+        started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
         self.assertFalse(started)
         self.assertIsNone(p._monitor_thread)
 
-    def test_starts_thread_when_db_active_and_thread_dead(self):
+    def test_returns_false_when_runtime_state_empty(self):
         p = self._make_p()
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        p._read_runtime_state.return_value = {}
+        started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
+        self.assertFalse(started)
+
+    def test_starts_thread_when_desired_active_and_thread_dead(self):
+        p = self._make_p()
+        p._read_runtime_state.return_value = {"desired_active": True}
+        settings = {"monitored_channels": "@nasa"}
         with patch("threading.Thread") as mock_thread:
             mock_thread.return_value.is_alive.return_value = False
             started = p._ensure_monitoring_thread(settings)
         self.assertTrue(started)
         self.assertTrue(p._monitoring_active)
 
-    def test_skips_when_heartbeat_and_poll_are_recent(self):
-        from datetime import datetime, timezone as dt_timezone
+    def test_restarts_after_stale_heartbeat(self):
+        """desired_active=True + dead thread + lock available → restart regardless of old heartbeat state."""
         p = self._make_p()
-        recent_ts = datetime.now(dt_timezone.utc).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": recent_ts,
-            "last_poll_time": recent_ts,
-            "poll_interval_minutes": 15,
-        }
-        started = p._ensure_monitoring_thread(settings)
-        self.assertFalse(started)
-        self.assertIsNone(p._monitor_thread)
-
-    def test_restarts_when_heartbeat_is_stale(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._make_p()
-        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": stale_hb,
-            "poll_interval_minutes": 15,
-        }
+        p._read_runtime_state.return_value = {"desired_active": True}
         with patch("threading.Thread") as mock_thread:
             mock_thread.return_value.is_alive.return_value = False
-            started = p._ensure_monitoring_thread(settings)
+            started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
         self.assertTrue(started)
 
     def test_skips_when_no_channels_configured(self):
         p = self._make_p()
-        settings = {"monitoring_active": True, "monitored_channels": ""}
-        started = p._ensure_monitoring_thread(settings)
+        p._read_runtime_state.return_value = {"desired_active": True}
+        started = p._ensure_monitoring_thread({"monitored_channels": ""})
         self.assertFalse(started)
 
     def test_skips_when_ytdlp_missing(self):
         p = self._make_p()
         p._ytdlp_path = None
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
-        started = p._ensure_monitoring_thread(settings)
+        p._read_runtime_state.return_value = {"desired_active": True}
+        started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
         self.assertFalse(started)
 
     def test_skips_when_thread_already_alive(self):
         p = self._make_p()
+        p._read_runtime_state.return_value = {"desired_active": True}
         alive_thread = MagicMock()
         alive_thread.is_alive.return_value = True
         p._monitor_thread = alive_thread
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
-        started = p._ensure_monitoring_thread(settings)
+        started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
         self.assertFalse(started)
+        p._acquire_monitor_lock.assert_not_called()
 
-    def test_ghost_heartbeat_fresh_hb_stale_poll_does_not_skip(self):
-        """Ghost-heartbeat: fresh heartbeat but stale last_poll must NOT prevent thread start."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
+    def test_skips_when_lock_held_by_another_process(self):
+        """If another process holds the lock, skip — it is already monitoring."""
         p = self._make_p()
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
-        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": fresh_hb,
-            "last_poll_time": stale_poll,
-            "poll_interval_minutes": 15,
-        }
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._acquire_monitor_lock.return_value = False
         with patch("threading.Thread") as mock_thread:
-            mock_thread.return_value.is_alive.return_value = False
-            started = p._ensure_monitoring_thread(settings)
-        # Must have started a thread despite fresh heartbeat, because poll is stale
-        self.assertTrue(started)
+            started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
+        self.assertFalse(started)
+        mock_thread.assert_not_called()
 
 
 class TestDiagnosticsNewFields(unittest.TestCase):
@@ -1428,7 +1571,9 @@ class TestDiagnosticsNewFields(unittest.TestCase):
         from datetime import datetime, timezone as dt_timezone
         p = self._make_p()
         now_ts = datetime.now(dt_timezone.utc).isoformat()
-        result = p._handle_diagnostics({"settings": {"last_poll_time": now_ts}})
+        # last_poll_time now lives in runtime_state, not settings
+        p._read_runtime_state.return_value = {"last_poll_time": now_ts}
+        result = p._handle_diagnostics({"settings": {}})
         self.assertIn("last_poll_age_seconds", result["details"])
         age = result["details"]["last_poll_age_seconds"]
         self.assertIsNotNone(age)
@@ -1444,12 +1589,13 @@ class TestDiagnosticsNewFields(unittest.TestCase):
         from datetime import datetime, timezone as dt_timezone, timedelta
         p = self._make_p()
         stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
+        # desired_active, last_poll_time, and poll_interval_minutes now live in runtime_state
+        p._read_runtime_state.return_value = {
+            "desired_active": True,
             "last_poll_time": stale_poll,
             "poll_interval_minutes": 15,
         }
-        result = p._handle_diagnostics({"settings": settings})
+        result = p._handle_diagnostics({"settings": {}})
         # Stale-poll condition must trigger a warning-level result
         self.assertIn(result["status"], ("warning", "error"),
                       f"Expected warning/error status for stale poll, got: {result['status']}")
@@ -1462,12 +1608,12 @@ class TestDiagnosticsNewFields(unittest.TestCase):
         from datetime import datetime, timezone as dt_timezone, timedelta
         p = self._make_p()
         stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": False,
+        # last_poll_time now lives in runtime_state; desired_active=False (default)
+        p._read_runtime_state.return_value = {
+            "desired_active": False,
             "last_poll_time": stale_poll,
-            "poll_interval_minutes": 15,
         }
-        result = p._handle_diagnostics({"settings": settings})
+        result = p._handle_diagnostics({"settings": {}})
         # When monitoring is inactive, stale poll alone must not degrade status to warning
         # (other issues from the test env might raise warnings, so just check the stale-poll
         # age is still populated but status is not warning *due to* the poll check)
@@ -1484,15 +1630,19 @@ class TestDiagnosticsNewFields(unittest.TestCase):
     def test_empty_epg_warning_when_active_and_no_programs(self):
         p = self._make_p()
         mock_source = MagicMock()
+        # desired_active now lives in runtime_state, not settings
+        import datetime as _dt
+        now_ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        p._read_runtime_state.return_value = {
+            "desired_active": True,
+            "last_poll_time": now_ts,
+        }
         with patch("plugin.EPGSource") as mock_es, \
              patch("plugin.ProgramData") as mock_pd:
             mock_es.objects.filter.return_value.first.return_value = mock_source
             mock_pd.objects.filter.return_value.count.return_value = 0
             settings = {
-                "monitoring_active": True,
                 "epg_source_name": "YouTube Live",
-                "last_poll_time": __import__("datetime").datetime.now(
-                    __import__("datetime").timezone.utc).isoformat(),
             }
             result = p._handle_diagnostics({"settings": settings})
         # Empty EPG with active monitoring must produce a warning/error status
@@ -1665,43 +1815,6 @@ class TestWebhookFieldVisibility(unittest.TestCase):
         self.assertFalse(config["is_legacy"])
 
 
-# ── _is_heartbeat_recent ────────────────────────────────────────────────────
-
-class TestIsHeartbeatRecent(unittest.TestCase):
-    from datetime import datetime, timezone as _tz, timedelta as _td
-
-    def _p(self):
-        return _make_plugin()
-
-    def test_recent_heartbeat_returns_true(self):
-        from datetime import datetime, timezone as dt_timezone
-        p = self._p()
-        hb = datetime.now(dt_timezone.utc).isoformat()
-        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": hb, "poll_interval_minutes": 15}))
-
-    def test_stale_heartbeat_returns_false(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._p()
-        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        self.assertFalse(p._is_heartbeat_recent({"monitoring_heartbeat": stale, "poll_interval_minutes": 15}))
-
-    def test_no_heartbeat_returns_false(self):
-        self.assertFalse(self._p()._is_heartbeat_recent({}))
-
-    def test_none_heartbeat_returns_false(self):
-        self.assertFalse(self._p()._is_heartbeat_recent({"monitoring_heartbeat": None}))
-
-    def test_malformed_heartbeat_returns_false(self):
-        self.assertFalse(self._p()._is_heartbeat_recent({"monitoring_heartbeat": "not-a-date"}))
-
-    def test_threshold_uses_poll_interval(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._p()
-        # 9 minutes ago — within the default 15+10=25 min threshold
-        recent_ish = (datetime.now(dt_timezone.utc) - timedelta(minutes=9)).isoformat()
-        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": recent_ish, "poll_interval_minutes": 5}))
-
-
 # ── Stale-poll detection helpers ─────────────────────────────────────────────
 
 class TestStaleEPGDetectionHelpers(unittest.TestCase):
@@ -1830,24 +1943,6 @@ class TestStaleEPGDetectionHelpers(unittest.TestCase):
         self.assertFalse(result["source_found"])
         self.assertEqual(result["current"], 0)
 
-    # --- ghost heartbeat property ---
-
-    def test_fresh_heartbeat_alone_is_not_healthy_when_poll_stale(self):
-        """The core ghost-heartbeat invariant: heartbeat alone must not be treated as healthy."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._p()
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
-        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        # heartbeat is fresh but last_poll is stale → NOT recent
-        self.assertTrue(p._is_heartbeat_recent({"monitoring_heartbeat": fresh_hb, "poll_interval_minutes": 15}))
-        self.assertFalse(p._is_last_poll_recent({"last_poll_time": stale_poll, "poll_interval_minutes": 15}))
-        # combined: both must be true for healthy
-        combined = (
-            p._is_heartbeat_recent({"monitoring_heartbeat": fresh_hb, "poll_interval_minutes": 15})
-            and p._is_last_poll_recent({"last_poll_time": stale_poll, "poll_interval_minutes": 15})
-        )
-        self.assertFalse(combined)
-
 
 # ── _handle_refresh behavior ─────────────────────────────────────────────────
 
@@ -1876,57 +1971,36 @@ def _mock_cfg(settings):
 class TestHandleRefreshBehavior(unittest.TestCase):
 
     def test_active_with_alive_thread_returns_status_not_refresh(self):
-        from datetime import datetime, timezone as dt_timezone
         p = _make_refresh_plugin()
         alive = MagicMock()
         alive.is_alive.return_value = True
         p._monitor_thread = alive
-        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
-                    "last_poll_time": datetime.now(dt_timezone.utc).isoformat()}
+        p._read_runtime_state.return_value = {"desired_active": True}
+        settings = {"poll_interval_minutes": 15}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_refresh({"settings": settings})
         self.assertIn("active", result["message"].lower())
         self.assertNotIn("restart", result["message"].lower())
 
-    def test_active_with_recent_heartbeat_returns_status_not_refresh(self):
-        from datetime import datetime, timezone as dt_timezone
+    def test_active_with_alive_thread_does_not_call_ensure(self):
+        """Live thread → _ensure_monitoring_thread never invoked."""
         p = _make_refresh_plugin()
-        recent_hb = datetime.now(dt_timezone.utc).isoformat()
-        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
-                    "monitoring_heartbeat": recent_hb,
-                    "last_poll_time": recent_hb}
-        with patch("plugin.PluginConfig", _mock_cfg(settings)):
-            result = p._handle_refresh({"settings": settings})
-        self.assertIn("active", result["message"].lower())
-
-    def test_active_with_recent_heartbeat_and_poll_does_not_start_thread(self):
-        """Both heartbeat and last_poll must be recent to skip _ensure_monitoring_thread."""
-        from datetime import datetime, timezone as dt_timezone
-        p = _make_refresh_plugin()
-        p._ensure_monitoring_thread = MagicMock(return_value=False)
-        recent_ts = datetime.now(dt_timezone.utc).isoformat()
-        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
-                    "monitoring_heartbeat": recent_ts, "last_poll_time": recent_ts}
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._ensure_monitoring_thread = MagicMock()
+        settings = {"poll_interval_minutes": 15}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             p._handle_refresh({"settings": settings})
         p._ensure_monitoring_thread.assert_not_called()
 
-    def test_active_stale_heartbeat_dead_thread_restarts_monitoring(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
+    def test_active_dead_thread_restarts_monitoring(self):
+        """desired_active=True but no live thread → ensure called, restart message returned."""
         p = _make_refresh_plugin()
+        p._read_runtime_state.return_value = {"desired_active": True}
         p._ensure_monitoring_thread = MagicMock(return_value=True)
-        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {"monitoring_active": True, "poll_interval_minutes": 15,
-                    "monitoring_heartbeat": stale}
-        with patch("plugin.PluginConfig", _mock_cfg(settings)):
-            result = p._handle_refresh({"settings": settings})
-        p._ensure_monitoring_thread.assert_called_once()
-        self.assertIn("restart", result["message"].lower())
-
-    def test_active_no_heartbeat_dead_thread_restarts_monitoring(self):
-        p = _make_refresh_plugin()
-        p._ensure_monitoring_thread = MagicMock(return_value=True)
-        settings = {"monitoring_active": True, "poll_interval_minutes": 15}
+        settings = {"poll_interval_minutes": 15}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_refresh({"settings": settings})
         p._ensure_monitoring_thread.assert_called_once()
@@ -1934,7 +2008,7 @@ class TestHandleRefreshBehavior(unittest.TestCase):
 
     def test_inactive_runs_background_one_shot(self):
         p = _make_refresh_plugin()
-        settings = {"monitoring_active": False}
+        settings = {}
         with patch("plugin.PluginConfig", _mock_cfg(settings)), \
              patch("plugin.threading.Thread") as mock_thread:
             mock_t = MagicMock()
@@ -1944,53 +2018,15 @@ class TestHandleRefreshBehavior(unittest.TestCase):
         self.assertIn("background", result["message"].lower())
 
     def test_status_message_includes_poll_interval(self):
-        from datetime import datetime, timezone as dt_timezone
         p = _make_refresh_plugin()
         alive = MagicMock()
         alive.is_alive.return_value = True
         p._monitor_thread = alive
-        settings = {"monitoring_active": True, "poll_interval_minutes": 20}
+        p._read_runtime_state.return_value = {"desired_active": True}
+        settings = {"poll_interval_minutes": 20}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_refresh({"settings": settings})
         self.assertIn("20", result["message"])
-
-    def test_ghost_heartbeat_fresh_hb_stale_poll_dead_thread_triggers_refresh(self):
-        """Ghost-heartbeat scenario: fresh hb but stale last_poll and no local thread.
-        _handle_refresh must NOT return 'no manual refresh needed' — it must restart and poll."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = _make_refresh_plugin()
-        p._ensure_monitoring_thread = MagicMock(return_value=True)
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
-        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "poll_interval_minutes": 15,
-            "monitoring_heartbeat": fresh_hb,
-            "last_poll_time": stale_poll,
-        }
-        with patch("plugin.PluginConfig", _mock_cfg(settings)):
-            result = p._handle_refresh({"settings": settings})
-        # Must have called _ensure_monitoring_thread (attempted restart)
-        p._ensure_monitoring_thread.assert_called_once()
-        # Message must NOT say "no manual refresh needed"
-        self.assertNotIn("no manual refresh needed", result["message"].lower())
-
-    def test_ghost_heartbeat_fresh_hb_stale_poll_returns_restart_message(self):
-        """Ghost-heartbeat scenario result message should mention restart."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = _make_refresh_plugin()
-        p._ensure_monitoring_thread = MagicMock(return_value=True)
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
-        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "poll_interval_minutes": 15,
-            "monitoring_heartbeat": fresh_hb,
-            "last_poll_time": stale_poll,
-        }
-        with patch("plugin.PluginConfig", _mock_cfg(settings)):
-            result = p._handle_refresh({"settings": settings})
-        self.assertIn("restart", result["message"].lower())
 
 
 # ── _handle_start_monitoring behavior ───────────────────────────────────────
@@ -2018,24 +2054,20 @@ class TestHandleStartMonitoringBehavior(unittest.TestCase):
         self.assertEqual(result["status"], "running")
         self.assertIn("already active", result["message"].lower())
 
-    def test_active_with_recent_heartbeat_returns_already_active(self):
-        from datetime import datetime, timezone as dt_timezone
+    def test_lock_held_returns_already_active(self):
+        """If lock is held by another process, start returns 'already active'."""
         p = self._make_p()
-        recent_ts = datetime.now(dt_timezone.utc).isoformat()
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa",
-                    "monitoring_heartbeat": recent_ts, "last_poll_time": recent_ts,
-                    "poll_interval_minutes": 15}
+        p._acquire_monitor_lock.return_value = False
+        settings = {"monitored_channels": "@nasa"}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_start_monitoring({"settings": settings})
         self.assertEqual(result["status"], "running")
         self.assertIn("already active", result["message"].lower())
 
-    def test_active_stale_heartbeat_dead_thread_starts_monitoring(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
+    def test_lock_acquired_starts_thread(self):
+        """Lock acquired → thread started, status=running."""
         p = self._make_p()
-        stale = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa",
-                    "monitoring_heartbeat": stale, "poll_interval_minutes": 15}
+        settings = {"monitored_channels": "@nasa"}
         with patch("plugin.PluginConfig", _mock_cfg(settings)), \
              patch("plugin.threading.Thread") as mock_thread:
             mock_t = MagicMock()
@@ -2045,51 +2077,22 @@ class TestHandleStartMonitoringBehavior(unittest.TestCase):
         self.assertEqual(result["status"], "running")
         self.assertNotIn("already active", result["message"].lower())
 
-    def test_active_no_heartbeat_dead_thread_starts_monitoring(self):
+    def test_desired_active_written_to_runtime_state(self):
+        """Start always persists desired_active=True before attempting lock."""
         p = self._make_p()
-        settings = {"monitoring_active": True, "monitored_channels": "@nasa"}
+        settings = {"monitored_channels": "@nasa"}
         with patch("plugin.PluginConfig", _mock_cfg(settings)), \
-             patch("plugin.threading.Thread") as mock_thread:
-            mock_t = MagicMock()
-            mock_thread.return_value = mock_t
-            result = p._handle_start_monitoring({"settings": settings})
-        mock_t.start.assert_called_once()
-        self.assertNotIn("already active", result["message"].lower())
+             patch("plugin.threading.Thread"):
+            p._handle_start_monitoring({"settings": settings})
+        p._write_runtime_state.assert_called_with({"desired_active": True})
 
-    def test_inactive_with_channels_starts_monitoring(self):
+    def test_no_channels_returns_error(self):
+        """Missing monitored_channels returns error before any state write."""
         p = self._make_p()
-        settings = {"monitoring_active": False, "monitored_channels": "@nasa"}
-        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
-             patch("plugin.threading.Thread") as mock_thread:
-            mock_t = MagicMock()
-            mock_thread.return_value = mock_t
+        settings = {"monitored_channels": ""}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_start_monitoring({"settings": settings})
-        mock_t.start.assert_called_once()
-        self.assertEqual(result["status"], "running")
-
-    def test_ghost_heartbeat_fresh_hb_stale_poll_attempts_restart(self):
-        """Ghost-heartbeat: active=True, fresh heartbeat, stale last_poll, no local thread.
-        _handle_start_monitoring must NOT return 'already active' — it must attempt restart."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._make_p()
-        fresh_hb = datetime.now(dt_timezone.utc).isoformat()
-        stale_poll = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": fresh_hb,
-            "last_poll_time": stale_poll,
-            "poll_interval_minutes": 15,
-        }
-        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
-             patch("plugin.threading.Thread") as mock_thread:
-            mock_t = MagicMock()
-            mock_thread.return_value = mock_t
-            result = p._handle_start_monitoring({"settings": settings})
-        # Thread must have been started (not skipped)
-        mock_t.start.assert_called_once()
-        # Must NOT say "already active"
-        self.assertNotIn("already active", result["message"].lower())
+        self.assertEqual(result["status"], "error")
 
 
 # ── _cleanup_ended_streams ───────────────────────────────────────────────────
@@ -2404,7 +2407,7 @@ class TestDiagnosticsOrphanedAndStaleEPG(unittest.TestCase):
 # ── v1.20.2: auto-start + start/refresh race fix ────────────────────────────
 
 class TestAutoStartAndRaceFix(unittest.TestCase):
-    """Tests for v1.20.2 auto-start and duplicate-monitor prevention."""
+    """Tests for auto-start and duplicate-monitor prevention via file lock."""
 
     def _make_p(self):
         p = _make_plugin()
@@ -2416,42 +2419,13 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
         p._persist_settings = MagicMock()
         return p
 
-    # ── _is_starting_recent ──────────────────────────────────────────────────
+    # ── bootstrap: desired_active=True + no thread → one start ───────────────
 
-    def test_is_starting_recent_with_fresh_timestamp(self):
-        from datetime import datetime, timezone as dt_timezone
+    def test_bootstrap_starts_monitor_once_when_desired_active(self):
+        """desired_active=True + dead thread → _ensure_monitoring_thread starts exactly one thread."""
         p = self._make_p()
-        fresh = datetime.now(dt_timezone.utc).isoformat()
-        self.assertTrue(p._is_starting_recent({"monitoring_starting_at": fresh}))
-
-    def test_is_starting_recent_with_stale_timestamp(self):
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._make_p()
-        stale = (datetime.now(dt_timezone.utc) - timedelta(seconds=120)).isoformat()
-        self.assertFalse(p._is_starting_recent({"monitoring_starting_at": stale}))
-
-    def test_is_starting_recent_with_no_field(self):
-        self.assertFalse(self._make_p()._is_starting_recent({}))
-
-    def test_is_starting_recent_with_none_field(self):
-        self.assertFalse(self._make_p()._is_starting_recent({"monitoring_starting_at": None}))
-
-    def test_is_starting_recent_with_malformed_timestamp(self):
-        self.assertFalse(self._make_p()._is_starting_recent({"monitoring_starting_at": "not-a-date"}))
-
-    # ── bootstrap: monitoring_active=True + stale hb + no thread → one start ─
-
-    def test_bootstrap_starts_monitor_once_when_active_and_thread_dead(self):
-        """monitoring_active=True + dead thread + stale hb → ensure_monitoring_thread starts exactly one thread."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = self._make_p()
-        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": stale_hb,
-            "poll_interval_minutes": 15,
-        }
+        p._read_runtime_state.return_value = {"desired_active": True}
+        settings = {"monitored_channels": "@nasa"}
         with patch("threading.Thread") as mock_thread:
             mock_t = MagicMock()
             mock_thread.return_value = mock_t
@@ -2459,115 +2433,581 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(mock_t.start.call_count, 1)
 
-    def test_bootstrap_does_not_start_when_starting_at_fresh(self):
-        """monitoring_active=True + fresh monitoring_starting_at → ensure_monitoring_thread skips."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
+    def test_bootstrap_skips_when_lock_held(self):
+        """desired_active=True but lock already held → _ensure_monitoring_thread returns False."""
         p = self._make_p()
-        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        fresh_start = datetime.now(dt_timezone.utc).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": stale_hb,
-            "monitoring_starting_at": fresh_start,
-            "poll_interval_minutes": 15,
-        }
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._acquire_monitor_lock.return_value = False
         with patch("threading.Thread") as mock_thread:
-            started = p._ensure_monitoring_thread(settings)
+            started = p._ensure_monitoring_thread({"monitored_channels": "@nasa"})
         self.assertFalse(started)
         mock_thread.assert_not_called()
 
-    # ── handle_start_monitoring: fresh starting_at → already starting ─────────
+    # ── start_monitoring: lock-based duplicate prevention ────────────────────
 
-    def test_start_monitoring_returns_already_starting_when_starting_at_fresh(self):
-        """Start returns 'already starting' when another worker holds the lease."""
-        from datetime import datetime, timezone as dt_timezone
+    def test_start_lock_held_returns_already_active(self):
+        """Start when lock is held by another worker returns 'already active'."""
         p = self._make_p()
-        fresh_start = datetime.now(dt_timezone.utc).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_starting_at": fresh_start,
-            "poll_interval_minutes": 15,
-        }
-        with patch("plugin.PluginConfig", _mock_cfg(settings)):
-            result = p._handle_start_monitoring({"settings": settings})
-        self.assertEqual(result["status"], "running")
-        self.assertIn("starting", result["message"].lower())
-
-    def test_start_after_refresh_returns_already_active_when_heartbeat_fresh(self):
-        """Start after refresh/bootstrap sees fresh heartbeat+poll and returns already active."""
-        from datetime import datetime, timezone as dt_timezone
-        p = self._make_p()
-        fresh_ts = datetime.now(dt_timezone.utc).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": fresh_ts,
-            "last_poll_time": fresh_ts,
-            "poll_interval_minutes": 15,
-        }
+        p._acquire_monitor_lock.return_value = False
+        settings = {"monitored_channels": "@nasa"}
         with patch("plugin.PluginConfig", _mock_cfg(settings)):
             result = p._handle_start_monitoring({"settings": settings})
         self.assertEqual(result["status"], "running")
         self.assertIn("already active", result["message"].lower())
 
-    # ── handle_refresh: fresh starting_at → returns starting not manual poll ──
+    def test_start_thread_alive_returns_already_active(self):
+        """Start with a live local thread returns 'already active' immediately."""
+        p = self._make_p()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        settings = {"monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "running")
+        self.assertIn("already active", result["message"].lower())
+        p._acquire_monitor_lock.assert_not_called()
 
-    def test_refresh_returns_starting_message_when_monitor_just_claimed(self):
-        """Refresh with stale hb but fresh monitoring_starting_at returns 'starting' not one-shot poll."""
-        from datetime import datetime, timezone as dt_timezone, timedelta
-        p = _make_refresh_plugin()
-        stale_hb = (datetime.now(dt_timezone.utc) - timedelta(hours=2)).isoformat()
-        fresh_start = datetime.now(dt_timezone.utc).isoformat()
-        settings = {
-            "monitoring_active": True,
-            "monitored_channels": "@nasa",
-            "monitoring_heartbeat": stale_hb,
-            "monitoring_starting_at": fresh_start,
-            "poll_interval_minutes": 15,
-        }
-        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
-             patch("plugin.threading.Thread") as mock_thread:
-            result = p._handle_refresh({"settings": settings})
-        # Should NOT start a manual one-shot thread
-        mock_thread.assert_not_called()
-        self.assertIn("starting", result["message"].lower())
+    # ── stop_monitoring clears runtime state ──────────────────────────────────
 
-    # ── handle_stop_monitoring clears starting_at ─────────────────────────────
-
-    def test_stop_clears_monitoring_starting_at(self):
-        """Stop persists monitoring_starting_at=None so Start can work cleanly after."""
+    def test_stop_writes_desired_active_false_to_runtime_state(self):
+        """Stop persists desired_active=False in runtime_state (not settings)."""
         p = self._make_p()
         p._monitoring_active = True
-        p._persist_settings = MagicMock()
-        context = {"settings": {"monitoring_active": True, "monitoring_starting_at": "2026-06-06T12:00:00+00:00"}}
+        context = {"settings": {}}
         with patch("plugin.PluginConfig") as mock_cfg_cls:
             mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
             mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
             p._handle_stop_monitoring(context)
-        persisted = p._persist_settings.call_args[0][0]
-        self.assertIn("monitoring_starting_at", persisted)
-        self.assertIsNone(persisted["monitoring_starting_at"])
+        p._write_runtime_state.assert_called_with({"desired_active": False})
 
-    def test_stop_clears_heartbeat(self):
-        """Stop also persists monitoring_heartbeat=None."""
-        p = self._make_p()
+    def test_stop_clears_heartbeat_in_runtime_state(self):
+        """Stop thread writes last_heartbeat_at=None to runtime_state via the loop finally block."""
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
         p._monitoring_active = True
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = True
+        p._monitor_stop_event = stop_event
         p._persist_settings = MagicMock()
-        context = {"settings": {"monitoring_active": True}}
+        p._extraction_failures = {}
         with patch("plugin.PluginConfig") as mock_cfg_cls:
             mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
             mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
-            p._handle_stop_monitoring(context)
-        persisted = p._persist_settings.call_args[0][0]
-        self.assertIn("monitoring_heartbeat", persisted)
-        self.assertIsNone(persisted["monitoring_heartbeat"])
+            p._monitoring_loop(p._plugin_key)
+        written_calls = [call[0][0] for call in p._write_runtime_state.call_args_list]
+        found = any("last_heartbeat_at" in c and c["last_heartbeat_at"] is None for c in written_calls)
+        self.assertTrue(found, "monitoring_loop finally must clear last_heartbeat_at in runtime_state")
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_20_3(self):
-        self.assertEqual(Plugin.version, "1.20.3")
+    def test_version_is_1_30_0(self):
+        self.assertEqual(Plugin.version, "1.30.0")
+
+
+# ── Lifecycle stop vs explicit stop hardening (v1.30.0) ─────────────────────
+#
+# Plugin-only limitation: Dispatcharr core can still overwrite monitoring_active
+# via a stale-settings save. These tests guard only the plugin's own cleanup paths.
+
+class TestLifecycleVsExplicitStop(unittest.TestCase):
+    """stop() (lifecycle) must not write monitoring_active=False to DB.
+    Only _handle_stop_monitoring() (explicit user action) should do that.
+    """
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = True
+        p._monitor_thread = None
+        p._monitor_stop_event = MagicMock()
+        p._persist_settings = MagicMock()
+        p._cleanup_legacy_celery_task = MagicMock()
+        p._legacy_task_cleanup_done = False
+        return p
+
+    # ── stop() / lifecycle path ────────────────────────────────────────────
+
+    def test_lifecycle_stop_does_not_persist_monitoring_active(self):
+        """stop() must not write monitoring_active to DB under any key."""
+        p = self._make_p()
+        p.stop()
+        for call in p._persist_settings.call_args_list:
+            updates = call[0][0]
+            self.assertNotIn(
+                "monitoring_active", updates,
+                f"stop() must not write monitoring_active to DB; got updates={updates}",
+            )
+
+    def test_lifecycle_stop_clears_in_memory_flag(self):
+        """stop() must clear the in-memory _monitoring_active flag."""
+        p = self._make_p()
+        p.stop()
+        self.assertFalse(p._monitoring_active)
+
+    def test_lifecycle_stop_signals_stop_event(self):
+        """stop() must signal the monitor stop event."""
+        p = self._make_p()
+        p.stop()
+        p._monitor_stop_event.set.assert_called()
+
+    def test_lifecycle_stop_joins_running_thread(self):
+        """stop() must join a live monitor thread."""
+        p = self._make_p()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        p._monitor_thread = alive
+        p.stop()
+        alive.join.assert_called_once()
+
+    def test_lifecycle_stop_returns_stopped_status(self):
+        """stop() must return a dict with status='stopped'."""
+        p = self._make_p()
+        result = p.stop()
+        self.assertEqual(result.get("status"), "stopped")
+
+    # ── _handle_stop_monitoring() / explicit user-stop path ────────────────
+
+    def test_explicit_stop_writes_desired_active_false_to_runtime_state(self):
+        """_handle_stop_monitoring() must write desired_active=False to runtime_state."""
+        p = self._make_p()
+        context = {"settings": {}}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._handle_stop_monitoring(context)
+        p._write_runtime_state.assert_called_with({"desired_active": False})
+
+    # ── monitoring_loop finally block ─────────────────────────────────────
+
+    def _run_loop_to_exit(self):
+        """Run _monitoring_loop with a pre-set stop event so it exits immediately."""
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = True
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = True  # while loop exits immediately
+        p._monitor_stop_event = stop_event
+        p._persist_settings = MagicMock()
+        p._extraction_failures = {}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._monitoring_loop(p._plugin_key)
+        return p
+
+    def test_monitoring_loop_finally_does_not_write_monitoring_active_false(self):
+        """Thread finally-block must not write monitoring_active=False to DB."""
+        p = self._run_loop_to_exit()
+        for call in p._persist_settings.call_args_list:
+            updates = call[0][0]
+            self.assertFalse(
+                "monitoring_active" in updates and updates["monitoring_active"] is False,
+                f"monitoring loop finally must not write monitoring_active=False; got {updates}",
+            )
+
+    def test_monitoring_loop_finally_clears_heartbeat(self):
+        """Thread finally-block must clear last_heartbeat_at=None in runtime_state."""
+        p = self._run_loop_to_exit()
+        written_calls = [call[0][0] for call in p._write_runtime_state.call_args_list]
+        found = any(
+            "last_heartbeat_at" in c and c["last_heartbeat_at"] is None
+            for c in written_calls
+        )
+        self.assertTrue(found, "finally block must write last_heartbeat_at=None to runtime_state")
+
+    def test_monitoring_loop_finally_clears_in_memory_flag(self):
+        """Thread finally-block must clear the in-memory _monitoring_active flag."""
+        p = self._run_loop_to_exit()
+        self.assertFalse(p._monitoring_active)
+
+    # ── auto-restart survives lifecycle stop ───────────────────────────────
+
+    def test_ensure_monitoring_restarts_after_lifecycle_stop(self):
+        """After lifecycle stop(), _ensure_monitoring_thread must restart monitoring.
+
+        runtime_state still shows desired_active=True (lifecycle stop doesn't change it),
+        so ensure_monitoring_thread should start a new thread.
+        """
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = False  # cleared by lifecycle stop()
+        p._monitor_thread = None
+        p._monitor_stop_event = MagicMock()
+        p._persist_settings = MagicMock()
+        p._legacy_task_cleanup_done = False
+
+        # runtime_state still shows True — lifecycle stop preserved it
+        p._read_runtime_state.return_value = {"desired_active": True}
+        settings = {"monitored_channels": "@nasa"}
+        with patch("threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            started = p._ensure_monitoring_thread(settings)
+
+        self.assertTrue(started, "_ensure_monitoring_thread must restart after lifecycle stop")
+        self.assertTrue(p._monitoring_active)
+        mock_t.start.assert_called_once()
+
+
+# ── Cross-worker Refresh: worker A owns monitor, worker B calls Refresh ─────
+
+class TestCrossWorkerRefresh(unittest.TestCase):
+    """_handle_refresh must not fall through to a duplicate one-shot poll when
+    another worker process genuinely owns the monitor lock."""
+
+    def test_worker_b_refresh_reports_active_without_duplicate_poll(self):
+        """Worker B: desired_active=True, no local thread, lock held elsewhere
+        (worker A owns it) → truthful already-active response, no one-shot poll."""
+        p = _make_refresh_plugin()
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._ensure_monitoring_thread = MagicMock(return_value=False)
+        p._is_monitor_lock_held_by_other = MagicMock(return_value=True)
+        settings = {"poll_interval_minutes": 15}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            result = p._handle_refresh({"settings": settings})
+        mock_thread.assert_not_called()
+        self.assertNotEqual(result["status"], "error")
+        self.assertIn("active", result["message"].lower())
+        self.assertIn("another worker", result["message"].lower())
+
+    def test_worker_b_refresh_falls_through_when_lock_genuinely_free(self):
+        """Regression guard: if desired_active=True is stale and the lock is
+        genuinely free (nothing monitoring anywhere), Refresh must still fall
+        through to a one-shot poll rather than reporting false 'active'."""
+        p = _make_refresh_plugin()
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._ensure_monitoring_thread = MagicMock(return_value=False)
+        p._is_monitor_lock_held_by_other = MagicMock(return_value=False)
+        settings = {"poll_interval_minutes": 15}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+             patch("plugin.threading.Thread") as mock_thread:
+            mock_t = MagicMock()
+            mock_thread.return_value = mock_t
+            result = p._handle_refresh({"settings": settings})
+        mock_t.start.assert_called_once()
+        self.assertIn("background", result["message"].lower())
+
+
+# ── Cross-worker Stop: worker A's monitor loop observes worker B's stop ─────
+
+class TestCrossWorkerStop(unittest.TestCase):
+    """The monitor owner's loop must observe shared desired_active=False —
+    written by another worker's Stop Monitoring action — and exit/release
+    the lock, since the in-memory stop_event is per-process and invisible
+    to other workers."""
+
+    def test_owner_loop_observes_shared_stop_and_releases_lock(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = True
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False  # local stop_event was NOT signaled
+        p._monitor_stop_event = stop_event
+        p._persist_settings = MagicMock()
+        p._extraction_failures = {}
+        # Worker B already wrote desired_active=False to the shared file
+        p._read_runtime_state.return_value = {"desired_active": False}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._monitoring_loop(p._plugin_key)
+        self.assertFalse(p._monitoring_active, "loop must clear in-memory flag on cross-worker stop")
+        p._release_monitor_lock.assert_called_once()
+        # Never reached the DB poll cycle — exited on the shared-state check first
+        mock_cfg_cls.objects.get.assert_not_called()
+
+    def test_owner_loop_keeps_running_while_desired_active_stays_true(self):
+        """Sanity check: with desired_active still True and stop_event unset,
+        the loop does NOT exit via the cross-worker check (it proceeds to the
+        DB reload, which we make fail immediately to end the test quickly)."""
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = True
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        p._monitor_stop_event = stop_event
+        p._persist_settings = MagicMock()
+        p._extraction_failures = {}
+        p._read_runtime_state.return_value = {"desired_active": True}
+        with patch("plugin.PluginConfig") as mock_cfg_cls:
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.side_effect = mock_cfg_cls.DoesNotExist
+            p._monitoring_loop(p._plugin_key)
+        # Reached the DB reload (and bailed there) rather than exiting on the
+        # desired_active check, proving that check did not fire spuriously.
+        mock_cfg_cls.objects.get.assert_called()
+
+
+# ── runtime_state.json concurrency ──────────────────────────────────────────
+
+class TestRuntimeStateConcurrency(unittest.TestCase):
+    """runtime_state.json read-modify-write must be serialized so a Stop's
+    desired_active=False cannot be silently lost by a concurrent heartbeat write."""
+
+    def _make_real_p(self, tmpdir):
+        p = Plugin.__new__(Plugin)
+        p._base_dir = Path(tmpdir)
+        p._runtime_state_path = p._base_dir / "runtime_state.json"
+        p._runtime_state_lock_path = p._base_dir / "runtime_state.lock"
+        p._runtime_state_thread_lock = threading.Lock()
+        p._log = lambda msg: None
+        p._log_error = lambda msg: None
+        return p
+
+    def test_concurrent_writes_preserve_desired_active_false(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = self._make_real_p(tmpdir)
+            p._runtime_state_path.write_text(json.dumps({
+                "desired_active": True, "last_heartbeat_at": "t0",
+            }))
+
+            # Widen the read-modify-write window so an unserialized implementation
+            # reliably loses an update; a properly serialized implementation stays
+            # correct regardless of this delay since the whole cycle is locked.
+            real_read = p._read_runtime_state
+
+            def slow_read():
+                state = real_read()
+                time.sleep(0.005)
+                return state
+
+            p._read_runtime_state = slow_read
+
+            def heartbeat_writer():
+                for i in range(20):
+                    p._write_runtime_state({"last_heartbeat_at": f"t{i}"})
+
+            def stop_writer():
+                time.sleep(0.01)  # let heartbeat writers get underway first
+                p._write_runtime_state({"desired_active": False})
+
+            threads = [threading.Thread(target=heartbeat_writer) for _ in range(4)]
+            threads.append(threading.Thread(target=stop_writer))
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+                self.assertFalse(t.is_alive(), "writer thread did not finish — possible deadlock")
+
+            final_state = json.loads(p._runtime_state_path.read_text())
+            self.assertFalse(
+                final_state.get("desired_active"),
+                "desired_active=False must survive concurrent heartbeat writes, not be lost to a race",
+            )
+
+
+# ── Reset All: cross-worker stop semantics ──────────────────────────────────
+
+class TestResetAllCrossWorkerStop(unittest.TestCase):
+    """Reset All must persist the stop intent first and wait for the monitor
+    lock to actually free up, even when this worker does not own it."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None  # this worker is NOT the monitor owner
+        p._monitoring_active = False
+        p._monitor_stop_event = MagicMock()
+        p._channel_group_name = "YouTube Live"
+        return p
+
+    def test_non_owner_reset_all_writes_stop_intent_before_deleting_and_waits_for_lock(self):
+        p = self._make_p()
+        # Lock is held by worker A for two polls, then frees up
+        p._is_monitor_lock_held_by_other = MagicMock(side_effect=[True, True, False])
+
+        mock_cfg = MagicMock()
+        mock_cfg.settings = {"tracked_streams": {"abc": {}}}
+
+        with patch("plugin.PluginConfig") as mock_cfg_cls, \
+             patch("plugin.ChannelGroup") as mock_group_cls, \
+             patch("plugin.time.sleep"):
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.return_value = mock_cfg
+            mock_group_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_group_cls.objects.get.side_effect = mock_group_cls.DoesNotExist
+
+            result = p._handle_reset_all({"settings": {"epg_source_name": ""}})
+
+        # Stop intent (desired_active=False) must be the first thing written,
+        # before tracked_streams are cleared or channels are touched.
+        first_call = p._write_runtime_state.call_args_list[0]
+        self.assertEqual(first_call[0][0], {"desired_active": False})
+
+        # Must have actually polled for lock release rather than assuming this
+        # worker owns it (this worker's _monitor_thread is None throughout).
+        self.assertEqual(p._is_monitor_lock_held_by_other.call_count, 3)
+        self.assertEqual(result["status"], "success")
+
+    def test_non_owner_reset_all_does_not_join_or_release_nonexistent_thread(self):
+        """When this worker never owned a local thread, Reset All must not
+        crash trying to join/release something it never held."""
+        p = self._make_p()
+        p._is_monitor_lock_held_by_other = MagicMock(return_value=False)
+
+        mock_cfg = MagicMock()
+        mock_cfg.settings = {"tracked_streams": {}}
+
+        with patch("plugin.PluginConfig") as mock_cfg_cls, \
+             patch("plugin.ChannelGroup") as mock_group_cls, \
+             patch("plugin.time.sleep"):
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.return_value = mock_cfg
+            mock_group_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_group_cls.objects.get.side_effect = mock_group_cls.DoesNotExist
+
+            result = p._handle_reset_all({"settings": {"epg_source_name": ""}})
+
+        p._release_monitor_lock.assert_called_once()
+        self.assertEqual(result["status"], "success")
+
+
+# ── Stop/Reset must never release monitor.lock out from under a thread that ─
+# is still alive after a join() timeout — a still-running owner must keep
+# ownership until it actually exits, so a second worker can never acquire the
+# lock and start a duplicate monitor while the first is still running.
+
+class TestStopAndResetLockRetention(unittest.TestCase):
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitoring_active = True
+        p._monitor_stop_event = MagicMock()
+        p._legacy_task_cleanup_done = False
+        p._cleanup_legacy_celery_task = MagicMock()
+        p._channel_group_name = "YouTube Live"
+        return p
+
+    def _alive_thread(self):
+        t = MagicMock()
+        t.is_alive.return_value = True  # still alive even after join() is called
+        return t
+
+    # ── Stop Monitoring ──────────────────────────────────────────────────────
+
+    def test_stop_timeout_retains_lock_while_thread_alive(self):
+        """join(timeout) elapses, thread still alive → lock must be retained,
+        not released, and status must not falsely claim 'stopped'."""
+        p = self._make_p()
+        p._monitor_thread = self._alive_thread()
+        p._read_runtime_state.return_value = {"desired_active": True}
+        result = p._handle_stop_monitoring({"settings": {}})
+        p._monitor_thread.join.assert_called_once_with(timeout=5.0)
+        p._release_monitor_lock.assert_not_called()
+        self.assertNotEqual(result["status"], "stopped")
+
+    def test_stop_thread_exits_within_timeout_releases_lock(self):
+        """Sanity check: thread exits before the join timeout → lock is
+        released and status is truthfully 'stopped'."""
+        p = self._make_p()
+        t = MagicMock()
+        t.is_alive.side_effect = [True, False]  # alive before join, dead after
+        p._monitor_thread = t
+        p._read_runtime_state.return_value = {"desired_active": True}
+        result = p._handle_stop_monitoring({"settings": {}})
+        p._release_monitor_lock.assert_called_once()
+        self.assertEqual(result["status"], "stopped")
+
+    def test_stop_non_owner_with_other_worker_active_reports_stopping_not_stopped(self):
+        """This worker never owned the local monitor thread (no thread ran here),
+        shared desired_active is True, and another worker still holds monitor.lock.
+        The response must truthfully signal a requested/in-progress stop rather
+        than falsely claiming monitoring has already stopped."""
+        p = self._make_p()
+        p._monitoring_active = False  # not the local owner
+        p._monitor_thread = None
+        p._read_runtime_state.return_value = {"desired_active": True}
+        p._is_monitor_lock_held_by_other = MagicMock(return_value=True)
+        result = p._handle_stop_monitoring({"settings": {}})
+        p._write_runtime_state.assert_called_with({"desired_active": False})
+        self.assertNotEqual(result["status"], "stopped")
+        self.assertEqual(result["status"], "stopping")
+
+    # ── Reset All ────────────────────────────────────────────────────────────
+
+    def test_reset_timeout_does_not_delete_or_repopulate_state(self):
+        """join(timeout) elapses, thread still alive → Reset All must abort
+        before touching tracked_streams, channels, or EPG data, and must not
+        release the lock the still-running thread owns."""
+        p = self._make_p()
+        p._monitor_thread = self._alive_thread()
+        with patch("plugin.PluginConfig") as mock_cfg_cls, \
+             patch("plugin.ChannelGroup") as mock_group_cls, \
+             patch("plugin.time.sleep"):
+            result = p._handle_reset_all({"settings": {"epg_source_name": ""}})
+        p._monitor_thread.join.assert_called_once_with(timeout=5.0)
+        p._release_monitor_lock.assert_not_called()
+        mock_cfg_cls.objects.get.assert_not_called()
+        mock_group_cls.objects.get.assert_not_called()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("running", result["message"].lower())
+
+    def test_reset_waits_and_succeeds_once_owner_exits(self):
+        """Thread exits within the join timeout → Reset All proceeds:
+        tracked_streams is cleared and channel/EPG cleanup runs normally."""
+        p = self._make_p()
+        t = MagicMock()
+        t.is_alive.side_effect = [True, False]
+        p._monitor_thread = t
+
+        mock_cfg = MagicMock()
+        mock_cfg.settings = {"tracked_streams": {"abc": {}}}
+
+        with patch("plugin.PluginConfig") as mock_cfg_cls, \
+             patch("plugin.ChannelGroup") as mock_group_cls, \
+             patch("plugin.time.sleep"):
+            mock_cfg_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_cfg_cls.objects.get.return_value = mock_cfg
+            mock_group_cls.DoesNotExist = type("DoesNotExist", (Exception,), {})
+            mock_group_cls.objects.get.side_effect = mock_group_cls.DoesNotExist
+
+            result = p._handle_reset_all({"settings": {"epg_source_name": ""}})
+
+        p._release_monitor_lock.assert_called_once()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(mock_cfg.settings["tracked_streams"], {})
+
+    # ── No duplicate monitor across the stop/start boundary ──────────────────
+
+    def test_no_duplicate_monitor_can_start_during_shutdown(self):
+        """End-to-end with a real flock-backed monitor.lock: while worker A's
+        monitor thread is still alive after Stop Monitoring's join timeout,
+        worker B's Start Monitoring must not acquire the lock or start a
+        second monitor thread."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / "monitor.lock"
+
+            worker_a = self._make_p()
+            worker_a._lock_path = lock_path
+            worker_a._lock_fd = None
+            worker_a._acquire_monitor_lock = Plugin._acquire_monitor_lock.__get__(worker_a)
+            worker_a._release_monitor_lock = Plugin._release_monitor_lock.__get__(worker_a)
+            self.assertTrue(worker_a._acquire_monitor_lock(), "worker A must start out owning the lock")
+
+            worker_a._monitor_thread = self._alive_thread()
+            worker_a._read_runtime_state.return_value = {"desired_active": True}
+            stop_result = worker_a._handle_stop_monitoring({"settings": {}})
+            self.assertNotEqual(stop_result["status"], "stopped")
+
+            worker_b = _make_plugin()
+            worker_b._plugin_key = "youtubearr"
+            worker_b._monitor_thread = None
+            worker_b._lock_path = lock_path
+            worker_b._lock_fd = None
+            worker_b._acquire_monitor_lock = Plugin._acquire_monitor_lock.__get__(worker_b)
+            settings = {"monitored_channels": "@nasa"}
+            with patch("plugin.PluginConfig", _mock_cfg(settings)), \
+                 patch("plugin.threading.Thread") as mock_thread:
+                start_result = worker_b._handle_start_monitoring({"settings": settings})
+
+            mock_thread.assert_not_called()
+            self.assertEqual(start_result["status"], "running")
+            self.assertIn("already active", start_result["message"].lower())
+
+            worker_a._release_monitor_lock()  # cleanup
 
 
 if __name__ == "__main__":

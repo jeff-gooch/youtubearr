@@ -1,5 +1,28 @@
 # YouTubearr Changelog
 
+## [1.30.0] - 2026-07-31
+
+### Fixed
+
+- **Cross-worker Stop Monitoring now actually stops the owning worker**: The monitor lock owner's background loop only watched its own process-local `stop_event`/in-memory flag. When a *different* Dispatcharr worker process called Stop Monitoring (or Reset All), it correctly wrote `desired_active=False` to the shared `runtime_state.json`, but the worker actually running the loop never looked at that file and kept polling indefinitely. `_monitoring_loop` now checks shared `desired_active` at the top of each cycle and once per second while sleeping between polls, so a stop/reset issued from any worker is observed and the lock is relinquished within about a second (or at most one in-flight poll cycle).
+- **Cross-worker Refresh no longer runs a duplicate one-shot poll**: When `desired_active=True` but a worker had no live local thread, `_handle_refresh` tried to restart monitoring locally; if that failed because another worker genuinely held the monitor lock, it fell through and ran a redundant one-shot poll anyway, racing the real owner. It now probes whether the lock is actually held elsewhere and, if so, returns a truthful "monitoring is active on another worker process" response instead of double-polling. The one-shot fallback still runs for the legitimate case where nothing is monitoring anywhere (e.g. stale `desired_active` with no channels configured).
+- **`runtime_state.json` read-modify-write is now serialized**: Writes (heartbeat, `desired_active`, `last_poll_time`, etc.) previously read-modified-wrote the file with no locking, so a heartbeat write from the monitor loop could race a Stop/Reset write from another worker and silently revert `desired_active` back to `True`. Writes are now serialized with a `threading.Lock` (in-process) plus a blocking `flock` on a dedicated `runtime_state.lock` file (cross-process) — separate from `monitor.lock` so this never contends with monitor-lock acquire/release.
+- **Reset All waits for the monitor lock to actually free up**: Previously waited a blind 3 seconds regardless of whether this worker or another worker owned the monitor. It now joins/releases its own thread if it owns one, and otherwise polls (bounded to 8 seconds) for the lock to become free — relying on the same shared-`desired_active` check above to make that wait meaningful instead of a guess.
+
+### Added
+
+- **Enhanced diagnostics — log exposure and operator hints**: The Diagnostics action now exposes additional fields useful for investigating problems without leaving the UI:
+  - `log_path` — absolute path to the plugin log file, so operators know exactly where to look when SSH access is available.
+  - `warning_count` and `recent_warnings` — count and last 5 `WARNING:`-level log lines from the recent scan window, surfacing problems that fall short of full errors.
+  - `recent_lines` — last 20 log lines from the scan window, giving a live at-a-glance view of plugin activity directly in the Diagnostics panel.
+  - `next_actions` — operator-readable action hints generated from detected issues (e.g., "Run Cleanup Ended Streams to remove orphaned entries", "Click Start Monitoring to restart the monitoring thread").
+
+### Internal
+
+- Thread-based single-path monitoring model confirmed and hardened. No external cron job or scheduler is required. The "Start Monitoring" button is the only entry point for background polling.
+- Monitoring coordination is sidecar-based (`runtime_state.json` + `monitor.lock`, both under the plugin data directory), not settings/DB-based. `_monitoring_loop`, `_ensure_monitoring_thread`, `_acquire_monitor_lock`/`_release_monitor_lock`, and the new `_is_monitor_lock_held_by_other` probe are the authoritative monitoring path.
+- New tests: `TestCrossWorkerRefresh`, `TestCrossWorkerStop`, `TestRuntimeStateConcurrency`, `TestResetAllCrossWorkerStop`, alongside the full suite carried forward from `1.20.3`: `TestEnsureMonitoringThread`, `TestHandleStartMonitoringBehavior`, `TestHandleRefreshBehavior`, `TestAutoStartAndRaceFix`, `TestDiagnosticsOrphanedAndStaleEPG`, `TestVersionConsistency`, and all supporting helpers.
+
 ## [1.20.3] - 2026-06-07
 
 ### Fixed

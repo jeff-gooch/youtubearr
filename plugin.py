@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import fcntl
 import threading
 import time
 import urllib.request
@@ -24,7 +25,7 @@ from core.scheduling import delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.20.3"
+    version = "1.30.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"
@@ -292,10 +293,22 @@ class Plugin:
         self._channel_group_name = "YouTube Live"
         self._starting_channel_number = 2000
 
+        # Runtime state sidecar (replaces settings-based runtime coordination)
+        self._runtime_state_path = self._base_dir / "runtime_state.json"
+        self._lock_path = self._base_dir / "monitor.lock"
+        self._lock_fd = None  # File descriptor for the acquired exclusive lock
+
+        # Dedicated lock serializing runtime_state.json read-modify-write across
+        # threads (in-process) and workers (cross-process via flock). Deliberately
+        # a separate file from monitor.lock so writing runtime state never
+        # contends with monitor-lock acquire/release.
+        self._runtime_state_lock_path = self._base_dir / "runtime_state.lock"
+        self._runtime_state_thread_lock = threading.Lock()
+
         # Monitoring thread
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop_event = threading.Event()
-        self._monitoring_active = False  # In-memory flag to prevent race with Dispatcharr form saves
+        self._monitoring_active = False  # In-memory flag (authoritative within this process)
         self._manual_refresh_lock = threading.Lock()
 
         # Stream profile cache
@@ -350,31 +363,32 @@ class Plugin:
         return response
 
     def stop(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Called when plugin is disabled/reloaded"""
-        if not context or "settings" not in context:
-            try:
-                cfg = PluginConfig.objects.get(key=self._plugin_key)
-                settings = dict(cfg.settings or {})
-            except PluginConfig.DoesNotExist:
-                settings = {}
-            context = {"settings": settings}
+        """Called when plugin is disabled/reloaded by Dispatcharr lifecycle.
 
-        return self._handle_stop_monitoring(context)
+        Stops the local in-memory thread only — does NOT write monitoring_active=False to DB.
+        DB state is preserved so _ensure_monitoring_thread can revive monitoring after reload.
+        Explicit user-initiated stops go through _handle_stop_monitoring() instead.
+        """
+        self._stop_thread_local()
+        return {"status": "stopped", "message": "Plugin lifecycle stop (monitoring state preserved)"}
+
+    def _stop_thread_local(self) -> None:
+        """Signal and join the local monitor thread without touching DB state.
+
+        For lifecycle events (plugin reload/disable). Does not persist any DB changes,
+        so monitoring_active=True is preserved in DB for auto-restart after reload.
+        _handle_stop_monitoring() is the explicit user-stop path that writes monitoring_active=False.
+        """
+        self._monitoring_active = False
+        self._monitor_stop_event.set()
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=5.0)
+        self._log("Local monitor thread stopped (lifecycle, DB state preserved)")
 
     # --- Action Handlers ---
 
     def _handle_status(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Return current status"""
-        # Always read fresh settings from DB for auto-restart check
-        try:
-            cfg = PluginConfig.objects.get(key=self._plugin_key)
-            settings = dict(cfg.settings or {})
-        except PluginConfig.DoesNotExist:
-            settings = context.get("settings", {})
-
-        tracked_streams = settings.get("tracked_streams", {})
-        monitoring_active = settings.get("monitoring_active", False)
-
         # Clean up the bogus Celery beat task left by older plugin versions (once per instance)
         # Must run before any early return, so it fires even when yt-dlp is missing.
         self._cleanup_legacy_celery_task()
@@ -386,18 +400,28 @@ class Plugin:
                 "message": "yt-dlp not found (bundled version may not be working). Check logs.",
             }
 
-        # Self-heal: restart the monitor thread if DB says active but no live thread exists
+        try:
+            cfg = PluginConfig.objects.get(key=self._plugin_key)
+            settings = dict(cfg.settings or {})
+        except PluginConfig.DoesNotExist:
+            settings = context.get("settings", {})
+
+        tracked_streams = settings.get("tracked_streams", {})
+        runtime = self._read_runtime_state()
+        desired_active = runtime.get("desired_active", False)
+
+        # Self-heal: restart the monitor thread if desired but no live thread
         self._ensure_monitoring_thread(settings)
 
-        message_parts = []
-        if monitoring_active:
-            message_parts.append(f"Monitoring active ({len(tracked_streams)} streams tracked)")
-        else:
-            message_parts.append(f"Monitoring inactive ({len(tracked_streams)} streams tracked)")
-
+        is_active = desired_active or self._monitoring_active
+        message = (
+            f"Monitoring active ({len(tracked_streams)} streams tracked)"
+            if is_active
+            else f"Monitoring inactive ({len(tracked_streams)} streams tracked)"
+        )
         return {
-            "status": "running" if monitoring_active else "stopped",
-            "message": " | ".join(message_parts) if message_parts else "Ready",
+            "status": "running" if is_active else "stopped",
+            "message": message,
         }
 
     def _handle_add_manual(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -567,53 +591,35 @@ class Plugin:
 
     def _handle_start_monitoring(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Start background monitoring thread"""
-        # Check dependencies
         if not self._ytdlp_path:
             return {
                 "status": "error",
                 "message": "yt-dlp not found (bundled version may not be working). Check logs.",
             }
 
-        # Fast path: local thread is alive — no DB round-trip needed
-        thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
-        if thread_alive:
+        # Fast path: local thread is alive
+        if self._monitor_thread and self._monitor_thread.is_alive():
             self._log("Monitoring already active (local thread alive)")
             return {"status": "running", "message": "Monitoring already active"}
 
-        # Read fresh settings from DB to avoid stale state
-        try:
-            cfg = PluginConfig.objects.get(key=self._plugin_key)
-            settings = dict(cfg.settings or {})
-        except PluginConfig.DoesNotExist:
-            settings = context.get("settings", {})
-
-        if settings.get("monitoring_active"):
-            if self._is_heartbeat_recent(settings) and self._is_last_poll_recent(settings):
-                self._log("Monitoring already active (fresh heartbeat and recent poll from running worker)")
-                return {"status": "running", "message": "Monitoring already active"}
-            if self._is_starting_recent(settings):
-                self._log("Monitoring already being claimed by another worker (fresh monitoring_starting_at)")
-                return {"status": "running", "message": "Monitoring already starting"}
-            self._log("monitoring_active=True but health stale (heartbeat or last_poll) — will restart")
-
+        settings = context.get("settings", {})
         monitored = settings.get("monitored_channels", "").strip()
         if not monitored:
             return {"status": "error", "message": "No channels to monitor. Add channel IDs/URLs in settings."}
 
-        # Atomically claim the monitor slot under a DB row lock.
-        # This prevents a second Dispatcharr worker from starting a duplicate thread
-        # in the window between this check and the thread's first heartbeat write.
-        claim = self._try_claim_monitor()
-        if claim == "already_running":
-            return {"status": "running", "message": "Monitoring already active"}
-        if claim == "already_starting":
-            return {"status": "running", "message": "Monitoring already starting"}
+        # Persist user intent before attempting lock acquisition
+        self._write_runtime_state({"desired_active": True})
 
-        # We hold the claim — start the thread
+        # Try to acquire the exclusive file lock (non-blocking).
+        # If another worker process holds it, a monitor is already running there.
+        if not self._acquire_monitor_lock():
+            self._log("Monitor lock held by another worker — monitoring already active")
+            return {"status": "running", "message": "Monitoring already active"}
+
+        # Lock acquired — start the thread
         self._monitoring_active = True
         self._monitor_stop_event.clear()
-        self._extraction_failures.clear()  # Fresh start: retry any previously-failed extractions
-        self._persist_settings({"extraction_failures": {}})
+        self._extraction_failures.clear()
 
         self._monitor_thread = threading.Thread(
             target=self._monitoring_loop,
@@ -633,29 +639,54 @@ class Plugin:
 
     def _handle_stop_monitoring(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Stop background monitoring thread"""
-        # Check if monitoring is active (either in-memory or DB)
-        settings = context.get("settings", {})
-        if not self._monitoring_active and not settings.get("monitoring_active"):
+        runtime = self._read_runtime_state()
+        if not self._monitoring_active and not runtime.get("desired_active"):
             return {"status": "stopped", "message": "Monitoring not active"}
 
-        # Step 1: Set DB flag FIRST - this is what threads in other workers will see
-        # Clear heartbeat and starting_at so Start can work cleanly after stop
-        updates = {
-            "monitoring_active": False,
-            "monitoring_heartbeat": None,
-            "monitoring_starting_at": None,
-        }
-        self._persist_settings(updates)
+        # Persist user intent — survives any Dispatcharr settings-save overwrite
+        self._write_runtime_state({"desired_active": False})
 
-        # Step 2: Set in-memory flag to stop
+        # Signal the local thread
         self._monitoring_active = False
-
-        # Step 3: Signal thread to stop
         self._monitor_stop_event.set()
 
-        # Step 4: Wait for thread to finish (with timeout)
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=5.0)
+            if self._monitor_thread.is_alive():
+                # Still mid-cycle after the join timeout — it still owns
+                # monitor.lock and will release it itself in _monitoring_loop's
+                # finally block. Releasing it here would free the lock while
+                # the thread is still running, letting another worker acquire
+                # it and start a second monitor concurrently. Leave it alone;
+                # desired_active=False is already persisted so the loop will
+                # observe it and exit at its next safe boundary.
+                self._log("Stop Monitoring: thread still shutting down after timeout; lock retained")
+                return {
+                    "status": "stopping",
+                    "message": (
+                        "Stop requested; monitor is finishing its current cycle "
+                        "and will stop shortly. Try again if this persists."
+                    ),
+                }
+
+        # Thread has exited (or was never running locally) — its finally
+        # block already released the lock; this call is a safety net.
+        self._release_monitor_lock()
+
+        # This worker never owned the local thread (it was None/not alive
+        # above), so the lock may still be held by another worker process
+        # that hasn't observed desired_active=False yet. Report the truthful
+        # "stopping" state instead of falsely claiming monitoring already
+        # stopped — the owning worker will exit at its next safe boundary.
+        if self._is_monitor_lock_held_by_other():
+            self._log("Stop Monitoring: lock held by another worker; stop requested")
+            return {
+                "status": "stopping",
+                "message": (
+                    "Stop requested; monitoring is active on another worker "
+                    "process and will stop at its next safe boundary."
+                ),
+            }
 
         self._log("Monitoring stopped")
         self._cleanup_legacy_celery_task()
@@ -669,57 +700,54 @@ class Plugin:
         """Manually trigger a refresh cycle"""
         self._log(f"!!! REFRESH ACTION TRIGGERED - Plugin version {self.version} !!!")
 
-        # Get settings from database to preserve monitoring_active flag
         try:
             cfg = PluginConfig.objects.get(key=self._plugin_key)
             settings = dict(cfg.settings or {})
         except PluginConfig.DoesNotExist:
             settings = context.get("settings", {})
 
-        # If monitoring is active, check whether the thread is actually running before deciding what to do.
-        # Running a second concurrent poll blocks the HTTP thread for minutes and causes
-        # 504 Gateway Timeouts — especially with many tracked streams.
-        if settings.get("monitoring_active"):
-            thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
-            heartbeat_recent = self._is_heartbeat_recent(settings)
-            last_poll_recent = self._is_last_poll_recent(settings)
+        runtime = self._read_runtime_state()
 
-            # Local thread alive → trust it unconditionally (it's this worker's own thread).
-            # Another worker healthy (fresh heartbeat + fresh last_poll) → also safe to skip.
-            # Do NOT skip on heartbeat alone when local thread is dead and last_poll is stale:
-            # the heartbeat may be a ghost from the process that died at restart.
-            if thread_alive or (heartbeat_recent and last_poll_recent):
-                # Monitoring is genuinely running — return informative status, no duplicate poll needed.
+        if runtime.get("desired_active"):
+            thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
+
+            if thread_alive:
                 poll_interval = settings.get("poll_interval_minutes", 15)
-                last_poll = settings.get("last_poll_time", "")
+                last_poll = runtime.get("last_poll_time", "")
                 last_poll_display = last_poll[:19].replace("T", " ") if last_poll else "unknown"
-                heartbeat_str = settings.get("monitoring_heartbeat", "")
-                heartbeat_display = heartbeat_str[:19].replace("T", " ") if heartbeat_str else "unknown"
+                last_hb = runtime.get("last_heartbeat_at", "")
+                last_hb_display = last_hb[:19].replace("T", " ") if last_hb else "unknown"
                 return {
                     "status": "success",
                     "message": (
                         f"Monitoring is active (polling every {poll_interval} min). "
-                        f"Last poll: {last_poll_display}. Heartbeat: {heartbeat_display}. "
+                        f"Last poll: {last_poll_display}. Heartbeat: {last_hb_display}. "
                         "No manual refresh needed."
                     ),
                 }
 
-            # monitoring_active=True but local thread dead and (heartbeat stale OR last_poll stale).
-            # Check for a concurrent claim before trying to restart ourselves.
-            if self._is_starting_recent(settings):
-                return {
-                    "status": "running",
-                    "message": "Monitoring is starting (just claimed by another process).",
-                }
+            # desired_active=True but local thread dead — attempt restart
             restarted = self._ensure_monitoring_thread(settings)
             if restarted:
                 return {
                     "status": "running",
                     "message": "Monitoring was marked active but was not running; restarted monitoring.",
                 }
-            # _ensure_monitoring_thread couldn't restart (no channels configured, another worker holds
-            # a fresh heartbeat, etc.) — fall through to the one-shot manual refresh below so EPG
-            # and stream state are still refreshed promptly.
+
+            # Could not restart locally. If another worker process genuinely holds
+            # the monitor lock, it is actively running the loop — report truthful
+            # already-active status instead of falling through to a duplicate
+            # one-shot poll that would race the owning worker's cycle.
+            if self._is_monitor_lock_held_by_other():
+                poll_interval = settings.get("poll_interval_minutes", 15)
+                return {
+                    "status": "success",
+                    "message": (
+                        f"Monitoring is active on another worker process (polling every "
+                        f"{poll_interval} min). No manual refresh needed."
+                    ),
+                }
+            # Lock is free (e.g. no channels configured or yt-dlp missing) — fall through to one-shot
 
         if not self._manual_refresh_lock.acquire(blocking=False):
             return {"status": "info", "message": "A manual refresh is already in progress — check logs for progress."}
@@ -788,33 +816,75 @@ class Plugin:
     def _handle_reset_all(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Reset all YouTubearr channels and tracking data to start fresh."""
         try:
-            # Step 1: Force-stop monitoring by setting DB flag FIRST
-            # This ensures any running thread (even in another worker) will see the stop signal
-            try:
-                cfg = PluginConfig.objects.get(key=self._plugin_key)
-                tracked_count = len(cfg.settings.get("tracked_streams", {}))
-                # IMPORTANT: Create new dict to ensure Django detects the change
-                # (In-place modification of JSONField may not trigger save properly)
-                new_settings = dict(cfg.settings or {})
-                new_settings["monitoring_active"] = False
-                new_settings["monitoring_heartbeat"] = None
-                new_settings["monitoring_starting_at"] = None
-                new_settings["tracked_streams"] = {}  # Clear immediately to prevent re-adds
-                cfg.settings = new_settings  # Assign new dict object
-                cfg.save(update_fields=["settings", "updated_at"])
-                self._log(f"Reset All: Set monitoring_active=False and cleared {tracked_count} tracked_streams")
-            except PluginConfig.DoesNotExist:
-                tracked_count = 0
+            # Step 1: Persist stop intent to runtime_state. tracked_streams is
+            # NOT cleared here — clearing it before the monitor is confirmed
+            # stopped would race a still-running owner (which reloads settings
+            # every cycle) into treating everything as new and re-adding
+            # entries while we go on to delete channels/EPG below. It is
+            # cleared further down, only once the monitor is confirmed stopped.
+            self._write_runtime_state({"desired_active": False})
 
-            # Step 2: Also call stop monitoring to set in-memory flag and stop event
+            # Step 2: Signal in-memory stop — covers the case where this worker
+            # is itself the monitor owner.
             self._monitoring_active = False
             self._monitor_stop_event.set()
             self._log("Reset All: Set in-memory stop flags")
 
-            # Step 3: Wait for any running monitoring thread to notice and stop
-            # The thread checks DB flag each poll cycle, so we wait a bit
-            time.sleep(3)
-            self._log("Reset All: Waited for monitoring thread to stop")
+            # Step 3: Wait for the monitor lock to become free. desired_active=False
+            # was already persisted in Step 1, so whichever worker holds the lock —
+            # this one or another — will observe it in _monitoring_loop and
+            # exit/release it. Join our own thread if we own it, then poll for lock
+            # release (bounded) instead of a blind sleep, so Reset All doesn't race
+            # a still-running monitor loop on another worker process.
+            #
+            # If our own thread is still alive after the join timeout, it still
+            # owns monitor.lock — do NOT release it out from under a running
+            # loop, and do NOT proceed to the destructive channel/EPG deletion
+            # below. Same if another worker still holds the lock once our own
+            # bounded wait expires: abort truthfully instead of reporting
+            # success while an owner may still be mid-poll.
+            monitor_confirmed_stopped = True
+            if self._monitor_thread and self._monitor_thread.is_alive():
+                self._monitor_thread.join(timeout=5.0)
+                if self._monitor_thread.is_alive():
+                    monitor_confirmed_stopped = False
+
+            if monitor_confirmed_stopped:
+                self._release_monitor_lock()
+                deadline = time.monotonic() + 8.0
+                lock_free = not self._is_monitor_lock_held_by_other()
+                while not lock_free and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    lock_free = not self._is_monitor_lock_held_by_other()
+                if not lock_free:
+                    monitor_confirmed_stopped = False
+
+            if not monitor_confirmed_stopped:
+                self._log("Reset All: aborted — monitor lock could not be confirmed free")
+                return {
+                    "status": "error",
+                    "message": (
+                        "Reset aborted: monitoring is still running or shutting down "
+                        "and the monitor lock could not be confirmed free. Wait a "
+                        "moment and try Reset All again."
+                    ),
+                }
+
+            self._log("Reset All: Confirmed monitoring thread stopped")
+
+            # Step 3b: Now that the monitor is confirmed stopped, clear
+            # tracked_streams in the DB — safe to do since no owner is left
+            # mid-poll to repopulate it out from under this reset.
+            try:
+                cfg = PluginConfig.objects.get(key=self._plugin_key)
+                tracked_count = len(cfg.settings.get("tracked_streams", {}))
+                new_settings = dict(cfg.settings or {})
+                new_settings["tracked_streams"] = {}
+                cfg.settings = new_settings
+                cfg.save(update_fields=["settings", "updated_at"])
+                self._log(f"Reset All: Cleared {tracked_count} tracked_streams")
+            except PluginConfig.DoesNotExist:
+                tracked_count = 0
 
             # Step 4: Get the channel group (read from settings, not hardcoded)
             group_name = context.get("settings", {}).get("channel_group_name", self._channel_group_name)
@@ -878,22 +948,23 @@ class Plugin:
         details["plugin_version"] = self.version
         details["plugin_key"] = self._plugin_key
 
-        # Monitoring state
-        monitoring_active_db = settings.get("monitoring_active", False)
+        # Monitoring state — read from runtime_state.json, not settings
+        runtime = self._read_runtime_state()
+        monitoring_active_db = runtime.get("desired_active", False)
         details["monitoring_active"] = monitoring_active_db
         thread_alive = bool(self._monitor_thread and self._monitor_thread.is_alive())
         details["monitor_thread_alive"] = thread_alive
-        details["last_poll_time"] = settings.get("last_poll_time") or "unknown"
-        _lpa = self._age_seconds(settings.get("last_poll_time"))
+        _last_poll = runtime.get("last_poll_time") or ""
+        details["last_poll_time"] = _last_poll or "unknown"
+        _lpa = self._age_seconds(_last_poll) if _last_poll else None
         details["last_poll_age_seconds"] = int(_lpa) if _lpa is not None else None
-        details["monitoring_heartbeat"] = settings.get("monitoring_heartbeat") or "unknown"
-        details["monitoring_starting_at"] = settings.get("monitoring_starting_at") or "unknown"
+        _hb = runtime.get("last_heartbeat_at") or ""
+        details["monitoring_heartbeat"] = _hb or "unknown"
 
         if monitoring_active_db and not thread_alive:
-            heartbeat_str = settings.get("monitoring_heartbeat")
-            if heartbeat_str:
+            if _hb:
                 try:
-                    hb = datetime.fromisoformat(heartbeat_str.replace("Z", "+00:00"))
+                    hb = datetime.fromisoformat(_hb.replace("Z", "+00:00"))
                     if hb.tzinfo is None:
                         hb = hb.replace(tzinfo=dt_timezone.utc)
                     if (datetime.now(tz=dt_timezone.utc) - hb).total_seconds() > 600:
@@ -904,7 +975,7 @@ class Plugin:
                 issues.append("warning:monitoring active but no heartbeat found")
 
         # Stale-poll warning — active but last_poll is beyond the expected cycle window
-        if monitoring_active_db and not self._is_last_poll_recent(settings):
+        if monitoring_active_db and not self._is_last_poll_recent(runtime):
             _poll_age_str = f"{int(_lpa)}s" if _lpa is not None else "never"
             issues.append(f"warning:monitoring active but last poll is stale (age={_poll_age_str})")
 
@@ -1051,8 +1122,31 @@ class Plugin:
         if stale_epg_tracked_count > 0:
             issues.append(f"warning:{stale_epg_tracked_count} tracked-live stream(s) have expired EPG data (may be stale)")
 
-        # Recent log summary
+        # Log file path and recent summary
+        details["log_path"] = str(self._log_path)
         details["log_summary"] = self._get_recent_log_summary()
+
+        # Next-action hints for operators
+        next_actions: List[str] = []
+        for _issue in issues:
+            if "yt-dlp binary not found" in _issue:
+                next_actions.append("Install or update yt-dlp in the plugin directory and reload the plugin")
+            elif "heartbeat is stale" in _issue or "no heartbeat found" in _issue:
+                next_actions.append("Click 'Start Monitoring' to restart the monitoring thread")
+            elif "last poll is stale" in _issue:
+                next_actions.append("Click 'Refresh Now' to trigger an immediate poll, or restart monitoring")
+            elif "EPG source has no current or future programs" in _issue:
+                next_actions.append("Click 'Refresh Now' to trigger an EPG refresh for the YouTubearr source")
+            elif "point to missing channels" in _issue:
+                next_actions.append("Run 'Cleanup Ended Streams' to remove orphaned tracked entries")
+            elif "stale (monitor may not be refreshing URLs)" in _issue:
+                next_actions.append("Check logs for URL refresh errors; monitoring may be stalled")
+            elif "legacy Celery beat task present" in _issue:
+                next_actions.append("Reload the plugin page — the legacy health-check task is removed automatically")
+            elif "expired EPG data" in _issue:
+                next_actions.append("Run 'Refresh Now' — EPG program data for live streams appears stale")
+        if next_actions:
+            details["next_actions"] = list(dict.fromkeys(next_actions))  # deduplicate, preserve order
 
         # Status
         errors = [i for i in issues if i.startswith("error:")]
@@ -1145,7 +1239,12 @@ class Plugin:
         return result
 
     def _get_recent_log_summary(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {"error_count": 0, "recent_errors": [], "status": "ok"}
+        result: Dict[str, Any] = {
+            "error_count": 0, "recent_errors": [],
+            "warning_count": 0, "recent_warnings": [],
+            "recent_lines": [],
+            "status": "ok",
+        }
         if not self._log_path.exists():
             result["status"] = "log file not found"
             return result
@@ -1161,8 +1260,14 @@ class Plugin:
             if size > max_bytes and lines:
                 lines = lines[1:]  # drop possibly-truncated first line
             error_lines = [l for l in lines if "ERROR:" in l]
+            warn_lines = [l for l in lines if "WARNING:" in l or "WARN:" in l]
             result["error_count"] = len(error_lines)
             result["recent_errors"] = [e[-120:] for e in error_lines[-5:]]
+            result["warning_count"] = len(warn_lines)
+            result["recent_warnings"] = [w[-120:] for w in warn_lines[-5:]]
+            # Last 20 lines give operators a live tail of plugin activity.
+            # Log content is safe: the plugin never writes cookies or auth tokens to the log.
+            result["recent_lines"] = [l[-200:] for l in lines[-20:]]
             result["lines_scanned"] = len(lines)
         except Exception as exc:
             result["status"] = f"read failed: {type(exc).__name__}"
@@ -2158,14 +2263,12 @@ class Plugin:
                         if not metadata:
                             self._log_error(f"Failed to extract metadata for {video_id} - yt-dlp returned None")
                             self._extraction_failures[video_id] = time.time()
-                            self._persist_extraction_failures()
                             continue
 
                         if metadata.get("_members_only"):
                             self._log(f"Skipping {video_id}: members-only content (retry in 7 days)")
                             # Store time 6 days in the future so the 24h check won't clear it for 7 days total
                             self._extraction_failures[video_id] = time.time() + 86400 * 6
-                            self._persist_extraction_failures()
                             continue
 
                         self._log(f"Metadata extracted for {video_id}: is_live={metadata.get('is_live')}, title={metadata.get('title')}")
@@ -2242,11 +2345,9 @@ class Plugin:
             except Exception as exc:
                 self._log_error(f"Failed to poll channel {channel_id}: {exc}")
 
-        # Persist updates
-        self._persist_settings({
-            "tracked_streams": tracked_streams,
-            "last_poll_time": timezone.now().isoformat(),
-        })
+        # Persist tracked_streams to settings; last_poll_time goes to runtime_state
+        self._persist_settings({"tracked_streams": tracked_streams})
+        self._write_runtime_state({"last_poll_time": timezone.now().isoformat()})
 
         return added_count, ended_count
 
@@ -2824,45 +2925,38 @@ class Plugin:
     # --- Monitoring Thread ---
 
     def _monitoring_loop(self, plugin_key: str) -> None:
-        """Background monitoring loop (runs in daemon thread)"""
+        """Background monitoring loop (runs in daemon thread).
+
+        The exclusive file lock is already held by the caller before this starts.
+        Heartbeat goes to runtime_state.json, not settings, so Dispatcharr form
+        saves cannot overwrite it.
+        """
         self._log("Monitoring loop started")
 
-        # Write the initial heartbeat immediately and clear the starting_at lease marker.
-        # This closes the race window between _try_claim_monitor() writing monitoring_starting_at
-        # and the first heartbeat update inside the poll loop: any concurrent Start/Refresh that
-        # reads after this point will see a fresh heartbeat and correctly return "already active".
-        try:
-            self._persist_settings({
-                "monitoring_heartbeat": timezone.now().isoformat(),
-                "monitoring_starting_at": None,
-            })
-        except Exception as _hb_exc:
-            self._log_error(f"Failed to write initial heartbeat: {_hb_exc}")
+        self._write_runtime_state({
+            "started_at": timezone.now().isoformat(),
+            "last_heartbeat_at": timezone.now().isoformat(),
+        })
 
         try:
-            # Restore extraction failures that survived from before last container restart
-            try:
-                cfg = PluginConfig.objects.get(key=plugin_key)
-                persisted_failures = dict(cfg.settings or {}).get("extraction_failures", {})
-                now = time.time()
-                loaded = 0
-                for vid, fail_time in persisted_failures.items():
-                    if fail_time + 86400 > now and vid not in self._extraction_failures:
-                        self._extraction_failures[vid] = fail_time
-                        loaded += 1
-                if loaded:
-                    self._log(f"Restored {loaded} persisted extraction failures from DB")
-            except PluginConfig.DoesNotExist:
-                pass
-
             while not self._monitor_stop_event.is_set():
                 try:
-                    # Check in-memory flag first (authoritative - DB flag can be overwritten by Dispatcharr)
+                    # In-memory flag is the stop signal for this process
                     if not self._monitoring_active:
                         self._log("Monitoring disabled (in-memory flag), stopping")
                         break
 
-                    # Reload settings from database
+                    # Cross-worker stop: another worker process may have written
+                    # desired_active=False to the shared runtime_state.json (via
+                    # Stop Monitoring or Reset All). The in-memory flag and
+                    # stop_event above are per-process and invisible to other
+                    # workers, so this owner loop must check the shared state
+                    # itself to notice and relinquish the lock.
+                    if not self._read_runtime_state().get("desired_active", True):
+                        self._log("Monitoring disabled (desired_active=False from another worker), stopping")
+                        break
+
+                    # Reload operator config from DB each cycle
                     try:
                         cfg = PluginConfig.objects.get(key=plugin_key)
                         settings = dict(cfg.settings or {})
@@ -2870,15 +2964,8 @@ class Plugin:
                         self._log_error("Plugin config not found, stopping monitoring")
                         break
 
-                    # Check if monitoring was stopped via DB flag (e.g., by Stop button in another worker)
-                    if not settings.get("monitoring_active"):
-                        self._log("DB shows monitoring_active=False, stopping monitoring thread")
-                        self._monitoring_active = False
-                        break
-
-                    # Update heartbeat to signal this thread is actively running
-                    # This prevents other Celery workers from starting duplicate threads
-                    self._persist_settings({"monitoring_heartbeat": timezone.now().isoformat()})
+                    # Update heartbeat in runtime_state (not settings)
+                    self._write_runtime_state({"last_heartbeat_at": timezone.now().isoformat()})
 
                     # Prune stale extraction failures to keep the dict bounded
                     try:
@@ -2891,59 +2978,137 @@ class Plugin:
                     # Poll channels
                     try:
                         added, ended = self._poll_monitored_channels(settings)
-
-                        # Refresh URLs
-                        refreshed = self._refresh_expiring_urls(settings)
-
-                        # Keep EPG times current for all active streams
+                        self._refresh_expiring_urls(settings)
                         self._refresh_epg_times(settings)
 
-                        # Cleanup if enabled
                         if settings.get("auto_cleanup", True):
                             cleaned = self._cleanup_ended_streams(settings)
                         else:
                             cleaned = 0
 
-                        # Trigger webhook if channels changed
                         if added > 0 or cleaned > 0:
                             self._trigger_webhook(settings)
 
                     except Exception as exc:
                         self._log_error(f"Poll cycle error: {exc}")
 
-                    # Sleep for poll interval
+                    # Sleep for poll interval in small chunks to respond to stop signal,
+                    # checking shared desired_active each second so a cross-worker Stop
+                    # or Reset All is noticed without waiting out the full poll interval.
                     poll_interval = settings.get("poll_interval_minutes", 15)
-                    sleep_seconds = poll_interval * 60
-
-                    # Sleep in small chunks so we can respond to stop signal
-                    for _ in range(int(sleep_seconds)):
+                    for _ in range(int(poll_interval * 60)):
                         if self._monitor_stop_event.is_set():
+                            break
+                        if not self._read_runtime_state().get("desired_active", True):
+                            self._log("Monitoring disabled during sleep (desired_active=False from another worker), stopping")
+                            self._monitor_stop_event.set()
                             break
                         time.sleep(1)
 
                 except Exception as exc:
                     self._log_error(f"Monitoring loop error: {exc}")
-                    time.sleep(60)  # Back off on error
+                    time.sleep(60)
 
         finally:
-            # Always clean up flags when thread exits (crash, break, or normal exit)
-            self._log("Monitoring loop exiting, cleaning up flags")
+            # Clear in-memory flag and heartbeat; release the lock.
+            # desired_active in runtime_state is NOT cleared here — lifecycle exits
+            # (container restart, plugin reload) preserve desired intent so
+            # _ensure_monitoring_thread can auto-restart. Only _handle_stop_monitoring
+            # clears desired_active.
+            self._log("Monitoring loop exiting")
             self._monitoring_active = False
-            try:
-                # Clear both monitoring_active and heartbeat so auto-restart can work on next startup
-                self._persist_settings({"monitoring_active": False, "monitoring_heartbeat": None})
-            except Exception as cleanup_exc:
-                self._log_error(f"Failed to persist monitoring_active=False: {cleanup_exc}")
+            self._write_runtime_state({"last_heartbeat_at": None})
+            self._release_monitor_lock()
 
         self._log("Monitoring loop stopped")
 
     # --- State Management ---
 
-    def _persist_extraction_failures(self) -> None:
-        """Persist non-expired extraction failures to DB so they survive container restarts."""
-        now = time.time()
-        to_save = {vid: t for vid, t in self._extraction_failures.items() if t + 86400 > now}
-        self._persist_settings({"extraction_failures": to_save})
+    def _read_runtime_state(self) -> Dict[str, Any]:
+        """Read the sidecar runtime_state.json file. Returns empty dict on any error."""
+        try:
+            return json.loads(self._runtime_state_path.read_text())
+        except Exception:
+            return {}
+
+    def _write_runtime_state(self, updates: Dict[str, Any]) -> None:
+        """Merge updates into runtime_state.json, serialized across threads/workers.
+
+        Without serialization, two concurrent read-modify-write cycles (e.g. the
+        monitor loop's heartbeat write racing a Stop/Reset from another worker)
+        can lose an update: whichever writer read stale data last overwrites the
+        other's change. A threading.Lock serializes writers within this process;
+        a blocking flock on a dedicated lock file (separate from monitor.lock)
+        serializes writers across worker processes.
+        """
+        with self._runtime_state_thread_lock:
+            try:
+                with open(str(self._runtime_state_lock_path), 'w') as lock_fd:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    try:
+                        state = self._read_runtime_state()
+                        state.update(updates)
+                        tmp = self._runtime_state_path.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(state))
+                        tmp.replace(self._runtime_state_path)
+                    finally:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception as exc:
+                self._log_error(f"Failed to write runtime state: {exc}")
+
+    def _acquire_monitor_lock(self) -> bool:
+        """Try to acquire the exclusive monitor file lock (non-blocking).
+
+        Uses fcntl.flock so the OS releases the lock automatically if this
+        process dies, preventing a permanently stuck state. Returns True if
+        the lock was acquired and stored in self._lock_fd.
+        """
+        try:
+            fd = open(str(self._lock_path), 'w')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fd = fd
+            return True
+        except (IOError, OSError):
+            try:
+                fd.close()
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
+    def _release_monitor_lock(self) -> None:
+        """Release the exclusive monitor file lock if held."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+            except Exception:
+                pass
+            self._lock_fd = None
+
+    def _is_monitor_lock_held_by_other(self) -> bool:
+        """Non-blocking probe: True if another process currently holds monitor.lock.
+
+        Returns False if this process already holds it (self._lock_fd is set) or
+        if the lock is currently free. Used to distinguish "another worker is
+        genuinely running the monitor loop" from "nothing is monitoring
+        anywhere" without acquiring or disturbing lock ownership.
+        """
+        if self._lock_fd is not None:
+            return False
+        try:
+            probe_fd = open(str(self._lock_path), 'w')
+        except Exception:
+            return False
+        try:
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+            return False
+        except (IOError, OSError):
+            return True
+        finally:
+            probe_fd.close()
 
     def _persist_settings(self, updates: Dict[str, Any]) -> None:
         """Persist settings updates to database (thread-safe)"""
@@ -3322,42 +3487,6 @@ class Plugin:
         except Exception as exc:
             self._log_error(f"Legacy Celery task cleanup failed: {exc}")
 
-    def _is_heartbeat_recent(self, settings: Dict[str, Any]) -> bool:
-        """Return True if the monitoring heartbeat is within the stale threshold."""
-        heartbeat_str = settings.get("monitoring_heartbeat")
-        if not heartbeat_str:
-            return False
-        try:
-            heartbeat = datetime.fromisoformat(heartbeat_str.replace("Z", "+00:00"))
-            if heartbeat.tzinfo is None:
-                heartbeat = heartbeat.replace(tzinfo=dt_timezone.utc)
-            age_seconds = (datetime.now(dt_timezone.utc) - heartbeat).total_seconds()
-            poll_interval_minutes = settings.get("poll_interval_minutes", 15)
-            threshold = (poll_interval_minutes + 10) * 60
-            return age_seconds < threshold
-        except (ValueError, TypeError):
-            return False
-
-    def _is_starting_recent(self, settings: Dict[str, Any]) -> bool:
-        """Return True if monitoring_starting_at is within 60 seconds.
-
-        A fresh monitoring_starting_at means another worker just claimed the monitor
-        slot via _try_claim_monitor but the thread may not have written its first
-        heartbeat yet. Callers should treat this as "already starting" and not launch
-        a duplicate thread.
-        """
-        starting_str = settings.get("monitoring_starting_at")
-        if not starting_str:
-            return False
-        try:
-            starting_at = datetime.fromisoformat(starting_str.replace("Z", "+00:00"))
-            if starting_at.tzinfo is None:
-                starting_at = starting_at.replace(tzinfo=dt_timezone.utc)
-            age_seconds = (datetime.now(dt_timezone.utc) - starting_at).total_seconds()
-            return age_seconds < 60
-        except (ValueError, TypeError):
-            return False
-
     def _parse_iso_datetime(self, value) -> Optional[datetime]:
         """Parse an ISO-8601 datetime string safely. Returns None on any failure."""
         if not value or not isinstance(value, str):
@@ -3416,80 +3545,27 @@ class Plugin:
             pass
         return result
 
-    def _try_claim_monitor(self) -> str:
-        """Atomically claim the monitor owner slot under a DB row lock.
-
-        Reads the current settings under select_for_update(), checks that no other
-        worker already owns the monitor (via heartbeat or starting_at), and if clear
-        writes monitoring_active=True and monitoring_starting_at=<now> as an
-        immediate lease. The monitoring loop clears monitoring_starting_at and
-        writes monitoring_heartbeat as soon as it starts.
-
-        Returns one of: "already_running", "already_starting", "claimed".
-        On any DB exception falls back to "claimed" (optimistic — better a second
-        thread than a permanent deadlock).
-        """
-        try:
-            with transaction.atomic():
-                try:
-                    cfg = PluginConfig.objects.select_for_update().get(key=self._plugin_key)
-                except PluginConfig.DoesNotExist:
-                    return "claimed"
-
-                s = dict(cfg.settings or {})
-
-                if s.get("monitoring_active"):
-                    if self._is_heartbeat_recent(s) and self._is_last_poll_recent(s):
-                        return "already_running"
-                    if self._is_starting_recent(s):
-                        return "already_starting"
-
-                # Claim: stamp starting_at immediately as proof of ownership
-                s["monitoring_active"] = True
-                s["monitoring_starting_at"] = timezone.now().isoformat()
-                cfg.settings = s
-                cfg.save(update_fields=["settings", "updated_at"])
-                return "claimed"
-        except Exception as exc:
-            self._log_error(f"_try_claim_monitor failed (proceeding optimistically): {exc}")
-            return "claimed"
-
     def _ensure_monitoring_thread(self, settings: Dict[str, Any]) -> bool:
-        """Restart the monitor thread if DB says active but no live thread is running.
+        """Restart the monitor thread if desired_active but no live thread is running.
 
-        This is the in-plugin self-healing / auto-start path: it handles container
-        restarts and crashed/hung threads without relying on any Celery task. Returns
-        True if a new thread was started.
+        Handles container restarts and crashed threads via the file lock: if the lock
+        can be acquired, no other process is monitoring, so we start. Returns True if
+        a new thread was started.
         """
-        if not settings.get("monitoring_active"):
+        runtime = self._read_runtime_state()
+        if not runtime.get("desired_active"):
             return False
 
-        thread_dead = not self._monitor_thread or not self._monitor_thread.is_alive()
-        if not thread_dead:
-            return False
-
-        # Another worker's thread may still be running — check the shared heartbeat AND last_poll.
-        # A fresh heartbeat alone is not sufficient: it may be a stale write from the process that
-        # died on the last container restart. Require both to be within threshold before skipping.
-        if self._is_heartbeat_recent(settings) and self._is_last_poll_recent(settings):
-            heartbeat_str = settings.get("monitoring_heartbeat", "")
-            self._log(f"Monitoring heartbeat and poll are recent (heartbeat={heartbeat_str[:19]}), skipping auto-restart")
-            return False
-
-        # Another worker may have just claimed the monitor slot (starting_at is fresh)
-        if self._is_starting_recent(settings):
-            starting_str = settings.get("monitoring_starting_at", "")
-            self._log(f"Monitoring claim is recent (monitoring_starting_at={starting_str[:19]}), skipping auto-restart")
+        if self._monitor_thread and self._monitor_thread.is_alive():
             return False
 
         channels = settings.get("monitored_channels", "").strip()
         if not channels or not self._ytdlp_path:
             return False
 
-        # Atomically claim the monitor slot before starting the thread
-        claim = self._try_claim_monitor()
-        if claim != "claimed":
-            self._log(f"Auto-restart skipped: monitor already claimed ({claim})")
+        # Try to acquire the lock — if another process holds it, it's already running
+        if not self._acquire_monitor_lock():
+            self._log("Auto-restart skipped: monitor lock held by another process")
             return False
 
         self._log("Auto-restarting monitoring after service restart")
