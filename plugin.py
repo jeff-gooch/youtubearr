@@ -25,7 +25,7 @@ from core.scheduling import delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.30.0"
+    version = "1.40.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"
@@ -311,8 +311,8 @@ class Plugin:
         self._monitoring_active = False  # In-memory flag (authoritative within this process)
         self._manual_refresh_lock = threading.Lock()
 
-        # Stream profile cache
-        self._stream_profile_id: Optional[int] = None
+        # Stream profile cache (holds the selected StreamProfile object)
+        self._stream_profile: Optional[Any] = None
 
         # Track assigned channel numbers during poll cycle to avoid duplicates
         self._assigned_channel_numbers: set = set()
@@ -1501,19 +1501,24 @@ class Plugin:
 
         video_title = metadata.get("title", "YouTube Live")
         video_id = metadata.get("video_id", "")
-        stream_url = metadata.get("stream_url", "")
         thumbnail = metadata.get("thumbnail", "")
         channel_thumbnail = metadata.get("channel_thumbnail", "")
         youtube_channel_name = metadata.get("youtube_channel_name", "YouTube")
         youtube_channel_id = metadata.get("youtube_channel_id", "")
 
+        # Selected once and reused for both the Stream and Channel below, and to
+        # decide whether the Stream needs the canonical watch URL (Streamlink) or
+        # the raw extracted URL (Proxy/other profiles).
+        stream_profile = self._select_stream_profile(settings)
+        playback_url = self._get_playback_url(metadata, stream_profile)
+
         # Create Stream (use video thumbnail for stream logo)
         stream = Stream.objects.create(
             name=video_title,
-            url=stream_url,
+            url=playback_url,
             logo_url=thumbnail if thumbnail else None,
             tvg_id=None,
-            stream_profile_id=self._get_stream_profile_id(settings),
+            stream_profile_id=stream_profile.id,
         )
 
         # Apply YouTubearr ownership tags to stream custom_properties
@@ -1598,7 +1603,7 @@ class Plugin:
             channel_number=channel_number,
             channel_group=group,
             logo=logo,
-            stream_profile_id=self._get_stream_profile_id(settings),
+            stream_profile_id=stream_profile.id,
         )
 
         # Track this channel number to avoid duplicates in same poll cycle
@@ -2044,8 +2049,16 @@ class Plugin:
         """
         return float(self._get_next_unmapped_base_number(settings)) + 0.1
 
-    def _get_stream_profile_id(self, settings: Optional[Dict[str, Any]] = None) -> int:
-        """Get or find a suitable stream profile ID.
+    def _select_stream_profile(self, settings: Optional[Dict[str, Any]] = None):
+        """Select the StreamProfile to use for a newly created/updated stream.
+
+        Priority:
+          1. Explicit `stream_profile_name` setting (user override).
+          2. A profile named "streamlink" — Streamlink resolves YouTube's HLS
+             manifest itself from the canonical watch URL, avoiding the 403s
+             that Dispatcharr's Proxy gets once yt-dlp's googlevideo URL expires.
+          3. A profile named/containing "proxy" (legacy default).
+          4. The first available profile.
 
         Args:
             settings: Plugin settings dict. If stream_profile_name is set, use that profile.
@@ -2057,19 +2070,27 @@ class Plugin:
                 profile = StreamProfile.objects.filter(name__iexact=profile_name).first()
                 if profile:
                     self._log(f"Using configured stream profile: {profile.name}")
-                    return profile.id
+                    return profile
                 else:
                     self._log(f"Warning: Stream profile '{profile_name}' not found, falling back to auto-detect")
 
-        # Use cached profile ID if available
-        if self._stream_profile_id is not None:
-            return self._stream_profile_id
+        # Use cached profile if available
+        if self._stream_profile is not None:
+            return self._stream_profile
 
-        # Try to find "proxy" profile (common default)
-        profile = (
-            StreamProfile.objects.filter(name__iexact="proxy").first()
-            or StreamProfile.objects.filter(name__icontains="proxy").first()
-        )
+        # Prefer a "streamlink" profile — required for YouTube playback to work
+        # past URL expiry, since Streamlink re-resolves the stream itself.
+        profile = StreamProfile.objects.filter(name__iexact="streamlink").first()
+
+        if not profile:
+            self._log_error(
+                "Warning: No 'streamlink' stream profile found. Falling back to Proxy — "
+                "YouTube segment requests may return 403 once the extracted URL expires."
+            )
+            profile = (
+                StreamProfile.objects.filter(name__iexact="proxy").first()
+                or StreamProfile.objects.filter(name__icontains="proxy").first()
+            )
 
         if not profile:
             profile = StreamProfile.objects.first()
@@ -2077,8 +2098,39 @@ class Plugin:
         if not profile:
             raise RuntimeError("No stream profiles found. Create a stream profile in Dispatcharr.")
 
-        self._stream_profile_id = profile.id
-        return self._stream_profile_id
+        self._stream_profile = profile
+        return profile
+
+    def _get_stream_profile_id(self, settings: Optional[Dict[str, Any]] = None) -> int:
+        """Get or find a suitable stream profile ID. See _select_stream_profile for priority."""
+        return self._select_stream_profile(settings).id
+
+    def _profile_name_is_streamlink(self, name: Any) -> bool:
+        """Return True if a StreamProfile name identifies it as a Streamlink profile."""
+        return "streamlink" in str(name or "").lower()
+
+    def _is_streamlink_profile_id(self, profile_id: Optional[int]) -> bool:
+        """Look up a StreamProfile by id and report whether it's a Streamlink profile."""
+        if not profile_id:
+            return False
+        try:
+            profile = StreamProfile.objects.filter(id=profile_id).first()
+            return bool(profile) and self._profile_name_is_streamlink(getattr(profile, "name", ""))
+        except Exception:
+            return False
+
+    def _get_playback_url(self, metadata: Dict[str, Any], profile: Any) -> str:
+        """Return the URL to store on the Stream for the given metadata and StreamProfile.
+
+        Streamlink resolves YouTube playback itself, so it must be given the stable
+        watch URL rather than yt-dlp's extracted googlevideo URL — that URL expires
+        within minutes and produces 403s on segment requests when handed to Proxy-style
+        profiles that just forward it as-is.
+        """
+        video_id = metadata.get("video_id", "")
+        if video_id and self._profile_name_is_streamlink(getattr(profile, "name", "")):
+            return f"https://www.youtube.com/watch?v={video_id}"
+        return metadata.get("stream_url", "")
 
     # --- YouTube Data API Integration ---
 
@@ -2716,11 +2768,18 @@ class Plugin:
                         # Update Stream object
                         try:
                             stream = Stream.objects.get(id=stream_data["stream_id"])
-                            stream.url = metadata["stream_url"]
+                            # Streams on a Streamlink profile keep the canonical watch
+                            # URL — Streamlink re-resolves it itself, so overwriting
+                            # with yt-dlp's short-lived googlevideo URL would break it.
+                            if self._is_streamlink_profile_id(getattr(stream, "stream_profile_id", None)):
+                                new_url = f"https://www.youtube.com/watch?v={video_id}"
+                            else:
+                                new_url = metadata["stream_url"]
+                            stream.url = new_url
                             stream.save(update_fields=["url"])
 
                             # Update tracked metadata
-                            stream_data["stream_url"] = metadata["stream_url"]
+                            stream_data["stream_url"] = new_url
                             stream_data["last_url_refresh"] = now.isoformat()
                             # Only update is_live if explicitly present in metadata
                             # Don't default to False as that causes premature cleanup

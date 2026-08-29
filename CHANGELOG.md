@@ -1,5 +1,19 @@
 # YouTubearr Changelog
 
+## [1.40.0] - 2026-08-29
+
+### Added
+
+- **Streamlink playback routing to fix 403s on YouTube segment requests**: Dispatcharr's Proxy profile forwards yt-dlp's extracted googlevideo URL as-is; once that URL expires (minutes to hours), every segment request 403s. YouTubearr now auto-selects a Dispatcharr Stream Profile named `streamlink` (if one exists) for new and refreshed streams, and stores the **canonical YouTube watch URL** (`https://www.youtube.com/watch?v=...`) as the stream's playback URL instead of the expiring direct link — Streamlink resolves the HLS manifest itself from that stable URL. Selection is by profile name, not a hardcoded ID.
+- If no `streamlink` profile is configured, YouTubearr logs a clear warning and falls back to the existing `proxy`-profile behavior, unchanged.
+- The explicit `stream_profile_name` setting (if configured) still takes priority over auto-detection, same as before.
+- URL refresh (`_refresh_expiring_urls`) now checks the stream's assigned profile: Streamlink-profile streams keep the canonical URL rather than being overwritten with a fresh (but still short-lived) googlevideo URL; Proxy-profile streams continue refreshing to the newly extracted URL as before.
+
+### Internal
+
+- Added `_select_stream_profile`, `_get_playback_url`, `_profile_name_is_streamlink`, and `_is_streamlink_profile_id` helpers in `plugin.py`. `_get_stream_profile_id` is now a thin wrapper over `_select_stream_profile` for backward compatibility.
+- New tests: `TestSelectStreamProfile`, `TestGetPlaybackUrl`, plus two new cases in `TestRefreshExpiringUrls` covering the Streamlink vs. Proxy refresh branches.
+
 ## [1.30.0] - 2026-07-31
 
 ### Fixed

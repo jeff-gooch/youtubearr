@@ -338,6 +338,7 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - YouTube stream URLs expire after ~6 hours
 - YouTubearr automatically refreshes URLs every hour
 - If a stream stops playing, try the **Refresh Now** action
+- **403 errors on segment requests**: This means Dispatcharr's Proxy is forwarding a googlevideo URL that has already expired. Create a Dispatcharr Stream Profile named `streamlink` (command `streamlink`, parameters `{streamUrl} --http-header User-Agent={userAgent} best --stdout`) — YouTubearr auto-selects it for new/refreshed streams so Streamlink resolves playback itself from the stable YouTube watch URL instead of a short-lived direct link. If no `streamlink` profile exists, YouTubearr logs a warning and falls back to Proxy with the raw extracted URL.
 
 ### Orphaned channels
 
@@ -356,6 +357,7 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - **QuickJS Runtime**: Bundled QuickJS-NG binary for yt-dlp's JavaScript requirements (PO token extraction)
 - **Zero API Quota**: Uses `yt-dlp --flat-playlist` instead of YouTube Data API
 - **Stream URL Refresh**: Automatic refresh every 60 minutes to prevent expiration
+- **Playback Routing**: New/refreshed streams auto-select a Dispatcharr Stream Profile named `streamlink` if one exists, storing the canonical YouTube watch URL so Streamlink resolves playback itself instead of relying on Proxy forwarding an expiring direct URL. Falls back to a `proxy`-named profile (with a logged warning) if no `streamlink` profile is configured.
 - **Channel Numbering**: Auto-assigned starting from 2000 to avoid conflicts
 - **Cookies Fallback**: Optional cookie authentication with automatic retry on extraction failure
 - **Thread Safety**: Uses Django's select_for_update() to prevent race conditions

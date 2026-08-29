@@ -1740,6 +1740,198 @@ class TestRefreshExpiringUrls(unittest.TestCase):
         p._refresh_expiring_urls(settings)
         p._persist_settings.assert_not_called()
 
+    def test_streamlink_profile_keeps_canonical_url(self):
+        """Streams on a 'streamlink' profile must keep the canonical watch URL,
+        not the short-lived googlevideo URL yt-dlp extracts."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=3)).isoformat()
+        video_id = "vid1"
+        stream_data = {
+            "is_live": True,
+            "last_url_refresh": old_ts,
+            "stream_id": 42,
+            "title": "Live Stream",
+        }
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {video_id: stream_data},
+        }
+        expiring_url = "https://rr1---sn-abc.googlevideo.com/videoplayback?expire=123"
+        p._extract_stream_metadata = MagicMock(return_value={"stream_url": expiring_url, "video_id": video_id})
+        mock_stream = MagicMock(stream_profile_id=2)
+        mock_profile = MagicMock(name="streamlink")
+        mock_profile.name = "streamlink"
+        with patch("plugin.Stream") as mock_stream_cls, patch("plugin.StreamProfile") as mock_profile_cls:
+            mock_stream_cls.objects.get.return_value = mock_stream
+            mock_profile_cls.objects.filter.return_value.first.return_value = mock_profile
+            count = p._refresh_expiring_urls(settings)
+        self.assertEqual(count, 1)
+        canonical = f"https://www.youtube.com/watch?v={video_id}"
+        self.assertEqual(mock_stream.url, canonical)
+        self.assertEqual(stream_data["stream_url"], canonical)
+
+    def test_non_streamlink_profile_uses_extracted_url(self):
+        """Streams on a non-Streamlink profile (e.g. Proxy) keep refreshing to the
+        freshly extracted URL, preserving existing behavior."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=3)).isoformat()
+        video_id = "vid1"
+        stream_data = {
+            "is_live": True,
+            "last_url_refresh": old_ts,
+            "stream_id": 42,
+            "title": "Live Stream",
+        }
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {video_id: stream_data},
+        }
+        new_url = "https://refreshed.example.com/stream.m3u8"
+        p._extract_stream_metadata = MagicMock(return_value={"stream_url": new_url, "video_id": video_id})
+        mock_stream = MagicMock(stream_profile_id=1)
+        mock_profile = MagicMock()
+        mock_profile.name = "proxy"
+        with patch("plugin.Stream") as mock_stream_cls, patch("plugin.StreamProfile") as mock_profile_cls:
+            mock_stream_cls.objects.get.return_value = mock_stream
+            mock_profile_cls.objects.filter.return_value.first.return_value = mock_profile
+            count = p._refresh_expiring_urls(settings)
+        self.assertEqual(count, 1)
+        self.assertEqual(mock_stream.url, new_url)
+        self.assertEqual(stream_data["stream_url"], new_url)
+
+
+# ── Stream profile selection (Streamlink wrapper) ───────────────────────────
+
+class TestSelectStreamProfile(unittest.TestCase):
+    """_select_stream_profile picks the right StreamProfile for YouTube playback."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._stream_profile = None
+        return p
+
+    def _profile(self, name, profile_id=1):
+        m = MagicMock()
+        m.name = name
+        m.id = profile_id
+        return m
+
+    def test_prefers_streamlink_profile_by_default(self):
+        p = self._make_p()
+        streamlink_profile = self._profile("streamlink", 2)
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.return_value.first.return_value = streamlink_profile
+            result = p._select_stream_profile({})
+        self.assertEqual(result, streamlink_profile)
+        mock_cls.objects.filter.assert_any_call(name__iexact="streamlink")
+
+    def test_falls_back_to_proxy_with_warning_when_streamlink_absent(self):
+        p = self._make_p()
+        proxy_profile = self._profile("proxy", 1)
+        logged_errors = []
+        p._log_error = lambda msg: logged_errors.append(msg)
+
+        def filter_side_effect(**kwargs):
+            m = MagicMock()
+            if kwargs.get("name__iexact") == "streamlink":
+                m.first.return_value = None
+            elif kwargs.get("name__iexact") == "proxy":
+                m.first.return_value = proxy_profile
+            else:
+                m.first.return_value = None
+            return m
+
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.side_effect = filter_side_effect
+            result = p._select_stream_profile({})
+        self.assertEqual(result, proxy_profile)
+        self.assertTrue(any("streamlink" in msg.lower() for msg in logged_errors))
+
+    def test_falls_back_to_first_profile_when_no_streamlink_or_proxy(self):
+        p = self._make_p()
+        any_profile = self._profile("HDHomeRun", 5)
+
+        def filter_side_effect(**kwargs):
+            m = MagicMock()
+            m.first.return_value = None
+            return m
+
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.side_effect = filter_side_effect
+            mock_cls.objects.first.return_value = any_profile
+            result = p._select_stream_profile({})
+        self.assertEqual(result, any_profile)
+
+    def test_raises_when_no_profiles_exist_at_all(self):
+        p = self._make_p()
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.return_value.first.return_value = None
+            mock_cls.objects.first.return_value = None
+            with self.assertRaises(RuntimeError):
+                p._select_stream_profile({})
+
+    def test_explicit_setting_overrides_streamlink_default(self):
+        p = self._make_p()
+        custom_profile = self._profile("MyCustomProfile", 9)
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.return_value.first.return_value = custom_profile
+            result = p._select_stream_profile({"stream_profile_name": "MyCustomProfile"})
+        self.assertEqual(result, custom_profile)
+        mock_cls.objects.filter.assert_any_call(name__iexact="MyCustomProfile")
+
+    def test_caches_auto_detected_profile(self):
+        p = self._make_p()
+        streamlink_profile = self._profile("streamlink", 2)
+        with patch("plugin.StreamProfile") as mock_cls:
+            mock_cls.objects.filter.return_value.first.return_value = streamlink_profile
+            p._select_stream_profile({})
+            mock_cls.objects.filter.reset_mock()
+            result = p._select_stream_profile({})
+        self.assertEqual(result, streamlink_profile)
+        mock_cls.objects.filter.assert_not_called()
+
+
+# ── Canonical playback URL selection ────────────────────────────────────────
+
+class TestGetPlaybackUrl(unittest.TestCase):
+    """_get_playback_url decides between canonical watch URL and extracted URL."""
+
+    def test_streamlink_profile_gets_canonical_watch_url(self):
+        p = _make_plugin()
+        profile = MagicMock()
+        profile.name = "streamlink"
+        metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
+        result = p._get_playback_url(metadata, profile)
+        self.assertEqual(result, "https://www.youtube.com/watch?v=abc123DEF45")
+
+    def test_streamlink_profile_name_case_insensitive(self):
+        p = _make_plugin()
+        profile = MagicMock()
+        profile.name = "Streamlink"
+        metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
+        result = p._get_playback_url(metadata, profile)
+        self.assertEqual(result, "https://www.youtube.com/watch?v=abc123DEF45")
+
+    def test_non_streamlink_profile_gets_extracted_url(self):
+        p = _make_plugin()
+        profile = MagicMock()
+        profile.name = "proxy"
+        expiring_url = "https://googlevideo.com/expiring"
+        metadata = {"video_id": "abc123DEF45", "stream_url": expiring_url}
+        result = p._get_playback_url(metadata, profile)
+        self.assertEqual(result, expiring_url)
+
+    def test_streamlink_profile_without_video_id_falls_back(self):
+        p = _make_plugin()
+        profile = MagicMock()
+        profile.name = "streamlink"
+        expiring_url = "https://googlevideo.com/expiring"
+        metadata = {"video_id": "", "stream_url": expiring_url}
+        result = p._get_playback_url(metadata, profile)
+        self.assertEqual(result, expiring_url)
+
 
 # ── Webhook UI: visible fields / hidden legacy IDs ──────────────────────────
 
@@ -2501,8 +2693,8 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_30_0(self):
-        self.assertEqual(Plugin.version, "1.30.0")
+    def test_version_is_1_40_0(self):
+        self.assertEqual(Plugin.version, "1.40.0")
 
 
 # ── Lifecycle stop vs explicit stop hardening (v1.30.0) ─────────────────────
