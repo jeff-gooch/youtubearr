@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import fcntl
+import tempfile
 import threading
 import time
 import urllib.request
@@ -341,6 +342,11 @@ class Plugin:
             settings.update(params)
         context["settings"] = settings
 
+        # Keep the plugin-owned cookies.txt sidecar aligned with current settings
+        # on the normal plugin run/save/status path, not only when a stream is created
+        # or refreshed.
+        self._sync_cookies_sidecar(settings)
+
         if action in {"", "status"}:
             response = self._handle_status(context)
         elif action == "add_manual":
@@ -369,6 +375,7 @@ class Plugin:
         DB state is preserved so _ensure_monitoring_thread can revive monitoring after reload.
         Explicit user-initiated stops go through _handle_stop_monitoring() instead.
         """
+        self._sync_cookies_sidecar((context or {}).get("settings", {}))
         self._stop_thread_local()
         return {"status": "stopped", "message": "Plugin lifecycle stop (monitoring state preserved)"}
 
@@ -1307,22 +1314,70 @@ class Plugin:
         return None
 
     def _get_cookies_file(self, cookies_content: str) -> Optional[str]:
-        """Write cookies content to a temp file and return the path.
+        """Sync the plugin-owned cookies.txt file and return its path.
 
-        Returns None if cookies_content is empty or invalid.
+        Returns None when cookies are not configured or could not be persisted.
+        Blank content removes any previously persisted cookie file so stale
+        credentials are not left behind for Streamlink/yt-dlp to reuse.
         """
-        if not cookies_content or not cookies_content.strip():
+        cookies_file = self._base_dir / "cookies.txt"
+        normalized = (cookies_content or "").strip()
+
+        if not normalized:
+            self._remove_cookies_file()
             return None
 
-        # Write to a file in the plugin's data directory
-        cookies_file = self._base_dir / "cookies.txt"
+        tmp_path = None
+        replaced_existing = False
         try:
-            cookies_file.write_text(cookies_content.strip() + "\n")
+            fd, tmp_name = tempfile.mkstemp(dir=str(self._base_dir), prefix=".cookies.", suffix=".tmp")
+            tmp_path = Path(tmp_name)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(normalized + "\n")
+
+            # Fail closed: if replacement fails, never leave an old cookies.txt behind
+            # for Streamlink/yt-dlp to keep using.
+            if cookies_file.exists():
+                cookies_file.unlink()
+                replaced_existing = True
+            os.replace(str(tmp_path), str(cookies_file))
             self._log(f"Wrote cookies to {cookies_file}")
             return str(cookies_file)
         except Exception as exc:
-            self._log_error(f"Failed to write cookies file: {exc}")
+            action = "replace" if replaced_existing else "write"
+            self._log_error(f"Failed to {action} cookies file: {exc}")
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self._remove_cookies_file(log_missing=False)
             return None
+
+    def _remove_cookies_file(self, log_missing: bool = False) -> None:
+        """Delete the plugin-owned cookies.txt if present."""
+        cookies_file = self._base_dir / "cookies.txt"
+        try:
+            if cookies_file.exists():
+                cookies_file.unlink()
+                self._log(f"Removed cookies file {cookies_file}")
+            elif log_missing:
+                self._log(f"Cookies file already absent: {cookies_file}")
+        except Exception as exc:
+            self._log_error(f"Failed to remove cookies file: {exc}")
+
+    def _sync_cookies_sidecar(self, settings: Optional[Dict[str, Any]]) -> bool:
+        """Align plugin-owned cookies.txt with settings on normal lifecycle/save paths.
+
+        Returns True when the sidecar is in the desired state, or False when non-blank
+        cookie content was configured but could not be persisted.
+        """
+        cookies_content = ""
+        if settings:
+            cookies_content = settings.get("cookies_content", "")
+        cookies_file = self._get_cookies_file(cookies_content)
+        return not (cookies_content or "").strip() or bool(cookies_file)
 
     def _extract_stream_metadata(self, video_id: str, quality_preference: str = "best", cookies_content: str = "") -> Optional[Dict[str, Any]]:
         """Extract stream metadata and URL using yt-dlp command-line tool.
@@ -1510,7 +1565,7 @@ class Plugin:
         # decide whether the Stream needs the canonical watch URL (Streamlink) or
         # the raw extracted URL (Proxy/other profiles).
         stream_profile = self._select_stream_profile(settings)
-        playback_url = self._get_playback_url(metadata, stream_profile)
+        playback_url = self._get_playback_url(metadata, stream_profile, settings)
 
         # Create Stream (use video thumbnail for stream logo)
         stream = Stream.objects.create(
@@ -2119,16 +2174,28 @@ class Plugin:
         except Exception:
             return False
 
-    def _get_playback_url(self, metadata: Dict[str, Any], profile: Any) -> str:
+    def _get_playback_url(self, metadata: Dict[str, Any], profile: Any, settings: Optional[Dict[str, Any]] = None) -> str:
         """Return the URL to store on the Stream for the given metadata and StreamProfile.
 
         Streamlink resolves YouTube playback itself, so it must be given the stable
         watch URL rather than yt-dlp's extracted googlevideo URL — that URL expires
         within minutes and produces 403s on segment requests when handed to Proxy-style
         profiles that just forward it as-is.
+
+        When a Streamlink profile is selected, also sync the plugin-owned cookies.txt
+        sidecar so the existing Dispatcharr StreamProfile parameters can opt into
+        `--http-cookies-file` without exposing raw cookie content on the command line.
         """
+        is_streamlink = self._profile_name_is_streamlink(getattr(profile, "name", ""))
+        cookies_content = ((settings or {}).get("cookies_content", "") if settings else "")
+        cookies_required = bool((cookies_content or "").strip())
+        if is_streamlink and cookies_required and not self._sync_cookies_sidecar(settings):
+            raise RuntimeError("Configured cookies could not be synced to cookies.txt; refusing Streamlink playback update")
+        if is_streamlink and not cookies_required:
+            self._sync_cookies_sidecar(settings)
+
         video_id = metadata.get("video_id", "")
-        if video_id and self._profile_name_is_streamlink(getattr(profile, "name", "")):
+        if video_id and is_streamlink:
             return f"https://www.youtube.com/watch?v={video_id}"
         return metadata.get("stream_url", "")
 
@@ -2772,6 +2839,14 @@ class Plugin:
                             # URL — Streamlink re-resolves it itself, so overwriting
                             # with yt-dlp's short-lived googlevideo URL would break it.
                             if self._is_streamlink_profile_id(getattr(stream, "stream_profile_id", None)):
+                                cookies_required = bool((cookies_content or "").strip())
+                                if cookies_required and not self._sync_cookies_sidecar(settings):
+                                    self._log_error(
+                                        f"Skipping Streamlink URL refresh for {video_id}: configured cookies could not be synced"
+                                    )
+                                    continue
+                                if not cookies_required:
+                                    self._sync_cookies_sidecar(settings)
                                 new_url = f"https://www.youtube.com/watch?v={video_id}"
                             else:
                                 new_url = metadata["stream_url"]

@@ -37,6 +37,7 @@ from plugin import Plugin  # noqa: E402
 
 def _make_plugin(qjs=False):
     p = Plugin.__new__(Plugin)
+    p._base_dir = Path(tempfile.mkdtemp(prefix="youtubearr-test-"))
     p._ytdlp_path = "/usr/bin/yt-dlp"
     p._qjs_path = "/usr/bin/qjs" if qjs else None
     p._log = lambda msg: None
@@ -1014,11 +1015,11 @@ class TestDiagnostics(unittest.TestCase):
 
     def test_diagnostics_does_not_expose_cookies_content(self):
         p = self._make_diag_plugin()
-        secret = "secret-cookie-value-xyz-unique"
-        ctx = {"settings": {"cookies_content": f"# Netscape HTTP Cookie File\n.example.com\t{secret}"}}
+        marker = "diagnostic-cookie-marker-xyz"
+        ctx = {"settings": {"cookies_content": f"# Netscape HTTP Cookie File\n.example.com\t{marker}"}}
         result = p._handle_diagnostics(ctx)
         details_str = json.dumps(result["details"], default=str)
-        self.assertNotIn(secret, details_str)
+        self.assertNotIn(marker, details_str)
         self.assertNotIn("cookies_content", details_str)
         # But should flag that cookies are configured
         self.assertTrue(result["details"]["cookies_configured"])
@@ -1197,7 +1198,7 @@ class TestGetRecentLogSummary(unittest.TestCase):
             combined = " ".join(result["recent_lines"])
             # Path is fine; raw cookie values must not appear
             self.assertNotIn("domain\tFALSE", combined)
-            self.assertNotIn("secret-cookie-value", combined)
+            self.assertNotIn("diagnostic-cookie-marker", combined)
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -1745,6 +1746,7 @@ class TestRefreshExpiringUrls(unittest.TestCase):
         not the short-lived googlevideo URL yt-dlp extracts."""
         from datetime import datetime, timezone as dt_timezone, timedelta
         p = self._make_p()
+        p._sync_cookies_sidecar = MagicMock(return_value=True)
         old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=3)).isoformat()
         video_id = "vid1"
         stream_data = {
@@ -1753,9 +1755,11 @@ class TestRefreshExpiringUrls(unittest.TestCase):
             "stream_id": 42,
             "title": "Live Stream",
         }
+        cookies_content = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
         settings = {
             "url_refresh_interval_seconds": 3600,
             "tracked_streams": {video_id: stream_data},
+            "cookies_content": cookies_content,
         }
         expiring_url = "https://rr1---sn-abc.googlevideo.com/videoplayback?expire=123"
         p._extract_stream_metadata = MagicMock(return_value={"stream_url": expiring_url, "video_id": video_id})
@@ -1770,6 +1774,42 @@ class TestRefreshExpiringUrls(unittest.TestCase):
         canonical = f"https://www.youtube.com/watch?v={video_id}"
         self.assertEqual(mock_stream.url, canonical)
         self.assertEqual(stream_data["stream_url"], canonical)
+        p._sync_cookies_sidecar.assert_called_once_with(settings)
+
+    def test_streamlink_profile_skips_refresh_when_cookie_sync_fails(self):
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        p._sync_cookies_sidecar = MagicMock(return_value=False)
+        old_ts = (datetime.now(dt_timezone.utc) - timedelta(hours=3)).isoformat()
+        video_id = "vid1"
+        original_url = "https://www.youtube.com/watch?v=old"
+        stream_data = {
+            "is_live": True,
+            "last_url_refresh": old_ts,
+            "stream_id": 42,
+            "title": "Live Stream",
+            "stream_url": original_url,
+        }
+        settings = {
+            "url_refresh_interval_seconds": 3600,
+            "tracked_streams": {video_id: stream_data},
+            "cookies_content": "configured-cookie",
+        }
+        p._extract_stream_metadata = MagicMock(return_value={"stream_url": "https://refreshed.example.com/stream.m3u8", "video_id": video_id})
+        mock_stream = MagicMock(stream_profile_id=2)
+        mock_stream.url = original_url
+        mock_profile = MagicMock(name="streamlink")
+        mock_profile.name = "streamlink"
+        with patch("plugin.Stream") as mock_stream_cls, patch("plugin.StreamProfile") as mock_profile_cls:
+            mock_stream_cls.objects.get.return_value = mock_stream
+            mock_profile_cls.objects.filter.return_value.first.return_value = mock_profile
+            count = p._refresh_expiring_urls(settings)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(mock_stream.url, original_url)
+        self.assertEqual(stream_data["stream_url"], original_url)
+        p._persist_settings.assert_not_called()
+        p._sync_cookies_sidecar.assert_called_once_with(settings)
 
     def test_non_streamlink_profile_uses_extracted_url(self):
         """Streams on a non-Streamlink profile (e.g. Proxy) keep refreshing to the
@@ -1914,6 +1954,38 @@ class TestGetPlaybackUrl(unittest.TestCase):
         result = p._get_playback_url(metadata, profile)
         self.assertEqual(result, "https://www.youtube.com/watch?v=abc123DEF45")
 
+    def test_streamlink_profile_syncs_cookie_file_without_exposing_content_in_args(self):
+        p = _make_plugin()
+        p._sync_cookies_sidecar = MagicMock(return_value=True)
+        profile = MagicMock()
+        profile.name = "streamlink"
+        metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
+        cookies_content = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
+        result = p._get_playback_url(metadata, profile, {"cookies_content": cookies_content})
+        self.assertEqual(result, "https://www.youtube.com/watch?v=abc123DEF45")
+        p._sync_cookies_sidecar.assert_called_once_with({"cookies_content": cookies_content})
+
+    def test_non_streamlink_profile_does_not_sync_cookie_file(self):
+        p = _make_plugin()
+        p._sync_cookies_sidecar = MagicMock(return_value=True)
+        profile = MagicMock()
+        profile.name = "proxy"
+        expiring_url = "https://googlevideo.com/expiring"
+        metadata = {"video_id": "abc123DEF45", "stream_url": expiring_url}
+        result = p._get_playback_url(metadata, profile, {"cookies_content": "cookie-value"})
+        self.assertEqual(result, expiring_url)
+        p._sync_cookies_sidecar.assert_not_called()
+
+    def test_streamlink_profile_with_configured_cookies_raises_when_sidecar_sync_fails(self):
+        p = _make_plugin()
+        p._sync_cookies_sidecar = MagicMock(return_value=False)
+        profile = MagicMock()
+        profile.name = "streamlink"
+        metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
+        with self.assertRaises(RuntimeError):
+            p._get_playback_url(metadata, profile, {"cookies_content": "configured-cookie"})
+        p._sync_cookies_sidecar.assert_called_once_with({"cookies_content": "configured-cookie"})
+
     def test_non_streamlink_profile_gets_extracted_url(self):
         p = _make_plugin()
         profile = MagicMock()
@@ -1931,6 +2003,121 @@ class TestGetPlaybackUrl(unittest.TestCase):
         metadata = {"video_id": "", "stream_url": expiring_url}
         result = p._get_playback_url(metadata, profile)
         self.assertEqual(result, expiring_url)
+
+
+class TestGetCookiesFile(unittest.TestCase):
+
+    def test_writes_cookie_file_with_owner_only_permissions(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cookies_path = Path(p._get_cookies_file("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"))
+            self.assertEqual(cookies_path, Path(tmpdir) / "cookies.txt")
+            self.assertEqual(cookies_path.read_text(), "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value\n")
+            self.assertEqual(cookies_path.stat().st_mode & 0o777, 0o600)
+
+    def test_blank_cookie_content_removes_stale_cookie_file(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cookies_path = Path(p._get_cookies_file("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"))
+            self.assertTrue(cookies_path.exists())
+            self.assertIsNone(p._get_cookies_file("   \n  "))
+            self.assertFalse(cookies_path.exists())
+
+    def test_failed_replace_cleans_up_same_directory_temp_file(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            with patch("plugin.os.replace", side_effect=OSError("boom")):
+                self.assertIsNone(
+                    p._get_cookies_file(
+                        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
+                    )
+                )
+
+            self.assertFalse((Path(tmpdir) / "cookies.txt").exists())
+            self.assertEqual(list(Path(tmpdir).glob(".cookies.*.tmp")), [])
+
+    def test_failed_replace_removes_stale_existing_cookie_file(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cookies_path = Path(tmpdir) / "cookies.txt"
+            cookies_path.write_text("stale-cookie\n")
+            with patch("plugin.os.replace", side_effect=OSError("boom")):
+                self.assertIsNone(
+                    p._get_cookies_file(
+                        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnew-cookie"
+                    )
+                )
+
+            self.assertFalse(cookies_path.exists())
+            self.assertEqual(list(Path(tmpdir).glob(".cookies.*.tmp")), [])
+
+
+class TestCookieSidecarLifecycle(unittest.TestCase):
+
+    def test_run_status_with_blank_cookies_removes_plugin_owned_cookie_file(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._handle_status = MagicMock(return_value={"status": "stopped", "message": "ok"})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cookies_path = Path(tmpdir) / "cookies.txt"
+            cookies_path.write_text("stale-cookie\n")
+
+            result = p.run("status", {}, {"settings": {"cookies_content": "   \n"}})
+
+            self.assertEqual(result["status"], "stopped")
+            self.assertFalse(cookies_path.exists())
+
+    def test_sync_cookies_sidecar_returns_false_when_nonblank_cookie_write_fails(self):
+        p = _make_plugin()
+        p._get_cookies_file = MagicMock(return_value=None)
+        self.assertFalse(p._sync_cookies_sidecar({"cookies_content": "configured-cookie"}))
+        p._get_cookies_file.assert_called_once_with("configured-cookie")
+
+    def test_sync_cookies_sidecar_preserves_no_cookie_operation(self):
+        p = _make_plugin()
+        p._get_cookies_file = MagicMock(return_value=None)
+        self.assertTrue(p._sync_cookies_sidecar({"cookies_content": "   "}))
+        p._get_cookies_file.assert_called_once_with("   ")
+
+
+class TestHandleAddManualCookieSyncFailures(unittest.TestCase):
+
+    def test_add_manual_reports_cookie_sync_failure_instead_of_claiming_success(self):
+        p = _make_plugin()
+        p._extract_video_id = MagicMock(return_value="abc123DEF45")
+        p._extract_stream_metadata = MagicMock(return_value={
+            "video_id": "abc123DEF45",
+            "title": "Members Stream",
+            "stream_url": "https://refreshed.example.com/stream.m3u8",
+            "youtube_channel_name": "Example",
+            "youtube_channel_id": "UC123",
+            "is_live": True,
+        })
+        p._create_stream_and_channel = MagicMock(
+            side_effect=RuntimeError("Configured cookies could not be synced to cookies.txt")
+        )
+        p._persist_settings = MagicMock()
+        p._send_telegram_notification = MagicMock()
+        p._trigger_webhook = MagicMock()
+
+        result = p._handle_add_manual({
+            "settings": {
+                "manual_url": "https://www.youtube.com/watch?v=abc123DEF45",
+                "tracked_streams": {},
+                "cookies_content": "configured-cookie",
+            }
+        })
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Configured cookies could not be synced", result["message"])
+        p._persist_settings.assert_not_called()
+        p._send_telegram_notification.assert_not_called()
+        p._trigger_webhook.assert_not_called()
 
 
 # ── Webhook UI: visible fields / hidden legacy IDs ──────────────────────────

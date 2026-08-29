@@ -67,7 +67,7 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
   - **Sequential**: Simple whole numbers (2000, 2001, 2002) for IPTV players that don't handle decimals
 - **Starting Channel Number**: First channel number to assign (default: 2000)
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
-- **YouTube Cookies**: Paste cookies in Netscape format for authenticated access
+- **YouTube Cookies**: Paste cookies in Netscape format for authenticated access. When using a Dispatcharr Stream Profile named `streamlink`, add `--http-cookies-file /data/plugins/youtubearr/cookies.txt` to that profile once so Streamlink can read the plugin-managed cookie file.
 - **Channel Profile**: Optional Dispatcharr channel profile to automatically add new channels to
 - **EPG Source Name**: Name of the EPG source for guide data (default: "YouTube Live"). Supports `{title}` and `{channel}` placeholders.
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
@@ -338,7 +338,7 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - YouTube stream URLs expire after ~6 hours
 - YouTubearr automatically refreshes URLs every hour
 - If a stream stops playing, try the **Refresh Now** action
-- **403 errors on segment requests**: This means Dispatcharr's Proxy is forwarding a googlevideo URL that has already expired. Create a Dispatcharr Stream Profile named `streamlink` (command `streamlink`, parameters `{streamUrl} --http-header User-Agent={userAgent} best --stdout`) — YouTubearr auto-selects it for new/refreshed streams so Streamlink resolves playback itself from the stable YouTube watch URL instead of a short-lived direct link. If no `streamlink` profile exists, YouTubearr logs a warning and falls back to Proxy with the raw extracted URL.
+- **403 errors on segment requests**: This means Dispatcharr's Proxy is forwarding a googlevideo URL that has already expired. Create a Dispatcharr Stream Profile named `streamlink` (command `streamlink`, parameters `{streamUrl} --http-header User-Agent={userAgent} --http-cookies-file /data/plugins/youtubearr/cookies.txt best --stdout`) — YouTubearr auto-selects it for new/refreshed streams so Streamlink resolves playback itself from the stable YouTube watch URL instead of a short-lived direct link. If no `streamlink` profile exists, YouTubearr logs a warning and falls back to Proxy with the raw extracted URL. The cookie file is owned/populated by YouTubearr and cleared when the field is emptied; do not paste raw cookies into the Stream Profile parameters.
 
 ### Orphaned channels
 
@@ -359,7 +359,7 @@ Some YouTube channels (like VirtualRailfan) have 70+ simultaneous streams. Use t
 - **Stream URL Refresh**: Automatic refresh every 60 minutes to prevent expiration
 - **Playback Routing**: New/refreshed streams auto-select a Dispatcharr Stream Profile named `streamlink` if one exists, storing the canonical YouTube watch URL so Streamlink resolves playback itself instead of relying on Proxy forwarding an expiring direct URL. Falls back to a `proxy`-named profile (with a logged warning) if no `streamlink` profile is configured.
 - **Channel Numbering**: Auto-assigned starting from 2000 to avoid conflicts
-- **Cookies Fallback**: Optional cookie authentication with automatic retry on extraction failure
+- **Cookies Fallback**: Optional cookie authentication with automatic retry on extraction failure. For Streamlink playback, YouTubearr also persists the configured cookie content to `/data/plugins/youtubearr/cookies.txt` with mode `0600` so an existing Stream Profile can safely reference it via `--http-cookies-file`.
 - **Thread Safety**: Uses Django's select_for_update() to prevent race conditions
 - **Auto-Recovery**: Monitoring automatically resumes after container/service restarts
 - **Ownership Tags**: Streams and program data are stamped with `owner: "youtubearr"` in custom properties
