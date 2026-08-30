@@ -7,11 +7,11 @@ replay code, settings fields, lifecycle states, or tests exist yet in
 **Release line**: `v1.5` here is a *proposed* future feature release line —
 nothing in this plan has a version number assigned yet, and none of it ships
 until implemented and reviewed on its own. The *current* released line is
-`v1.4.0` (Streamlink playback routing plus the cookie persistence/validation
+`v1.40.0` (Streamlink playback routing plus the cookie persistence/validation
 work it depends on, see `CHANGELOG.md`), which is unrelated in scope and must
 not be conflated with this plan. `manifest_version`/`capabilities` (plugins-v3
 compatibility prep, tracked as a separate future `v2.0` line) are **not**
-declared as of `v1.4.0` and are also unrelated to this plan.
+declared as of `v1.40.0` and are also unrelated to this plan.
 
 ## 1. Goal
 
@@ -37,7 +37,7 @@ unavailable.
   Dispatcharr host. This is playback-through-YouTube only — YouTube remains
   the source of truth and the only place video bytes are ever fetched from.
 - No change to `manifest_version`/`capabilities` in `plugin.json` — as of
-  `v1.4.0` none are declared yet (see `CHANGELOG.md`); that's separate,
+  `v1.40.0` none are declared yet (see `CHANGELOG.md`); that's separate,
   unreleased `v2.0` plugins-v3 compatibility prep, and this plan does not
   require or depend on it.
 - No `data_dir` migration. That's also deferred to a future release;
@@ -94,7 +94,7 @@ New settings field (style-matched to existing fields, e.g. `auto_cleanup` at
     "help_text": "How long to keep a channel alive after a livestream ends so "
                  "viewers can watch the YouTube VOD replay before the channel "
                  "is removed. Set to 0 to disable replay and clean up ended "
-                 "streams immediately (current v1.4.0 behavior).",
+                 "streams immediately (current v1.40.0 behavior).",
 }
 ```
 
@@ -114,7 +114,7 @@ operator can set manually, not what they get out of the box.
 ## 4. Exact current code to inspect/touch
 
 All line numbers are against `plugin.py` on `feat/streamlink-playback-wrapper`
-as of this planning pass; re-check before implementation since v1.4.0 changes
+as of this planning pass; re-check before implementation since v1.40.0 changes
 shifted some of these.
 
 | Area | Location | Why it matters |
@@ -269,7 +269,7 @@ beyond the stored `{streamUrl}` value.
 ## 10. Tests to add (planning-level list, not written yet)
 
 - `_cleanup_ended_streams` with `replay_retention_hours = 0` behaves
-  byte-identical to current v1.4.0 tests (regression guard for rollback path).
+  byte-identical to current v1.40.0 tests (regression guard for rollback path).
 - Transition unit tests for each lifecycle edge: `live -> replay_pending`,
   `replay_pending -> replay_available` (readiness confirmed),
   `replay_pending -> expired` (readiness terminal-negative before window
@@ -292,9 +292,9 @@ beyond the stored `{streamUrl}` value.
   placeholder interaction with existing `{title}`/`{channel}` EPG-name
   templating.
 
-## 11. Explicit separation from cookie auth (v1.4.0)
+## 11. Explicit separation from cookie auth (v1.40.0)
 
-Replay support and the v1.4.0 pasted-cookie workflow are unrelated concerns
+Replay support and the v1.40.0 pasted-cookie workflow are unrelated concerns
 that happen to share the same playback path:
 
 - Cookies (`cookies_content`, `_sync_cookies_sidecar`,
@@ -315,7 +315,7 @@ that happen to share the same playback path:
 ## 12. Canary acceptance criteria (before wider rollout)
 
 - `replay_retention_hours = 0` regression suite passes with zero behavior
-  diff from v1.4.0 (existing `_cleanup_ended_streams` tests untouched and
+  diff from v1.40.0 (existing `_cleanup_ended_streams` tests untouched and
   green).
 - On at least one real ended stream from a channel already tracked by this
   plugin instance (per `[[project_overview]]`-style operational testing, not

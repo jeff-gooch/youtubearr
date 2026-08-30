@@ -26,7 +26,7 @@ from core.scheduling import delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.4.0"
+    version = "1.40.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"

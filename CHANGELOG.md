@@ -1,6 +1,6 @@
 # YouTubearr Changelog
 
-## [1.4.0] - 2026-08-30
+## [1.40.0] - 2026-08-30
 
 ### Added
 
@@ -22,7 +22,7 @@
 
 ### Out of scope for this release
 
-- **Dispatcharr plugins-v3 manifest/capability compatibility** (`manifest_version`, `capabilities` declarations, sandbox enforcement) and **PO Token support** are deferred to a future release and are not part of v1.4.0.
+- **Dispatcharr plugins-v3 manifest/capability compatibility** (`manifest_version`, `capabilities` declarations, sandbox enforcement) and **PO Token support** are deferred to a future release and are not part of v1.40.0.
 
 ## [1.30.0] - 2026-07-31
 

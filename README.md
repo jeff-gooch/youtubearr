@@ -2,7 +2,7 @@
 
 YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestreams and adds them as playable channels. It uses yt-dlp to detect when streams go live, creates Dispatcharr channels with proper EPG support, and cleans them up when streams end. No YouTube API quota required. I built this with Claude's help - we're all using AI now, I'm just honest about it. 🤖
 
-> **v1.4.0 playback note**: recent YouTube/yt-dlp changes mean Dispatcharr's default Proxy playback profile can 403 on many streams (see [Stream playback issues](#stream-playback-issues)). Fixing this requires a one-time Streamlink Stream Profile, and for most channels also a pasted YouTube `cookies.txt` export in the **YouTube Cookies** setting — see [Configuration](#configuration) and [Troubleshooting](#troubleshooting) below.
+> **v1.40.0 playback note**: recent YouTube/yt-dlp changes mean Dispatcharr's default Proxy playback profile can 403 on many streams (see [Stream playback issues](#stream-playback-issues)). Fixing this requires a one-time Streamlink Stream Profile, and for most channels also a pasted YouTube `cookies.txt` export in the **YouTube Cookies** setting — see [Configuration](#configuration) and [Troubleshooting](#troubleshooting) below.
 
 ## Features
 

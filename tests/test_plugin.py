@@ -2093,7 +2093,7 @@ class TestCookieSidecarLifecycle(unittest.TestCase):
 
 
 class TestCookiesPastedContentContract(unittest.TestCase):
-    """v1.4.0 pasted cookies_content: validation and fail-closed behaviour."""
+    """v1.40.0 pasted cookies_content: validation and fail-closed behaviour."""
 
     def test_invalid_pasted_content_fails_closed_without_activating(self):
         p = _make_plugin()
@@ -2986,8 +2986,8 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_4_0(self):
-        self.assertEqual(Plugin.version, "1.4.0")
+    def test_version_is_1_40_0(self):
+        self.assertEqual(Plugin.version, "1.40.0")
 
 
 # ── Lifecycle stop vs explicit stop hardening (v1.30.0) ─────────────────────
