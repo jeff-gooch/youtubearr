@@ -26,7 +26,7 @@ from core.scheduling import delete_periodic_task
 
 class Plugin:
     name = "YouTubearr"
-    version = "1.40.0"
+    version = "1.4.0"
     description = "Zero-dependency YouTube livestream plugin with automatic monitoring and configurable numbering"
     author = "Jeff Gooch"
     help_url = "https://github.com/jeff-gooch/youtubearr"
@@ -214,7 +214,7 @@ class Plugin:
             "label": "YouTube Cookies",
             "type": "text",
             "default": "",
-            "help_text": "Paste YouTube cookies in Netscape format (cookies.txt content). Only used as fallback when streams fail to load without cookies. Get cookies using a browser extension like 'Get cookies.txt LOCALLY'.",
+            "help_text": "Paste YouTube cookies in Netscape/Mozilla format (cookies.txt content). Validated server-side before activating /data/plugins/youtubearr/cookies.txt for yt-dlp and external Streamlink profiles. Only used as fallback when streams fail to load without cookies. Get cookies using a browser extension like 'Get cookies.txt LOCALLY'.",
         },
     ]
 
@@ -275,6 +275,18 @@ class Plugin:
             },
             "button_label": "Reset All",
             "button_color": "red",
+        },
+        {
+            "id": "clear_cookies",
+            "label": "Clear Cookies",
+            "description": "Remove the configured cookies and delete the plugin-owned cookies.txt sidecar",
+            "confirm": {
+                "required": True,
+                "title": "Clear YouTube Cookies?",
+                "message": "This clears the YouTube Cookies field and deletes /data/plugins/youtubearr/cookies.txt until you paste a new cookies.txt export.",
+            },
+            "button_label": "Clear Cookies",
+            "button_color": "yellow",
         },
         {
             "id": "diagnostics",
@@ -361,6 +373,8 @@ class Plugin:
             response = self._handle_cleanup(context)
         elif action == "reset_all":
             response = self._handle_reset_all(context)
+        elif action == "clear_cookies":
+            response = self._handle_clear_cookies(context)
         elif action == "diagnostics":
             response = self._handle_diagnostics(context)
         else:
@@ -393,6 +407,21 @@ class Plugin:
         self._log("Local monitor thread stopped (lifecycle, DB state preserved)")
 
     # --- Action Handlers ---
+
+    def _handle_clear_cookies(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Clear the configured cookies and delete the plugin-owned cookies.txt sidecar."""
+        self._persist_settings({"cookies_content": ""})
+        settings = context.get("settings")
+        if isinstance(settings, dict):
+            settings["cookies_content"] = ""
+
+        self._remove_cookies_file(log_missing=False)
+        self._log("Cleared cookies configuration")
+
+        return {
+            "status": "success",
+            "message": "Cookies cleared. Paste a new cookies.txt export to re-enable authenticated playback.",
+        }
 
     def _handle_status(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Return current status"""
@@ -460,7 +489,6 @@ class Plugin:
 
         tracked_streams = settings.get("tracked_streams", {})
         quality = settings.get("stream_quality", "best")
-        cookies_content = settings.get("cookies_content", "")
 
         for url in urls:
             try:
@@ -530,7 +558,7 @@ class Plugin:
                         is_tracked = False
 
                 # Extract stream metadata
-                metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
+                metadata = self._extract_stream_metadata(video_id, quality, settings)
 
                 if not metadata:
                     errors.append(f"Failed to extract info for video {video_id}")
@@ -1027,10 +1055,15 @@ class Plugin:
         details["qjs_path"] = self._qjs_path or "not found"
         details["qjs_version"] = self._get_qjs_version()
 
-        # Cookies (configured/present, never expose content)
-        cookies_raw = settings.get("cookies_content", "")
-        details["cookies_configured"] = bool(cookies_raw and cookies_raw.strip())
-        details["cookies_file_present"] = (self._base_dir / "cookies.txt").exists()
+        # Cookies metadata (never expose contents or upload paths)
+        cookies_meta = self._get_cookies_metadata(settings)
+        details["cookies_configured"] = cookies_meta["configured"]
+        details["cookies_valid"] = cookies_meta["valid"]
+        details["cookies_last_modified"] = cookies_meta["mtime"]
+        details["cookies_age_seconds"] = cookies_meta["age_seconds"]
+        details["cookies_count"] = cookies_meta["count"]
+        if cookies_meta.get("error"):
+            issues.append(f"warning:{cookies_meta['error']}")
 
         # Webhooks
         media_cfg = self._get_media_refresh_webhook_config(settings)
@@ -1313,51 +1346,174 @@ class Plugin:
 
         return None
 
-    def _get_cookies_file(self, cookies_content: str) -> Optional[str]:
-        """Sync the plugin-owned cookies.txt file and return its path.
+    def _cookies_sidecar_path(self) -> Path:
+        return self._base_dir / "cookies.txt"
 
-        Returns None when cookies are not configured or could not be persisted.
-        Blank content removes any previously persisted cookie file so stale
-        credentials are not left behind for Streamlink/yt-dlp to reuse.
-        """
-        cookies_file = self._base_dir / "cookies.txt"
-        normalized = (cookies_content or "").strip()
+    def _cookies_are_configured(self, settings: Optional[Dict[str, Any]]) -> bool:
+        cookies_content = (settings or {}).get("cookies_content", "")
+        return bool((cookies_content or "").strip())
 
-        if not normalized:
-            self._remove_cookies_file()
-            return None
+    def _validate_cookies_text(self, cookies_text: str) -> Dict[str, Any]:
+        normalized = (cookies_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = normalized.strip("\n")
+        if not normalized.strip():
+            return {"valid": False, "error": "cookies file is empty", "count": None, "normalized_text": ""}
 
+        saw_header = False
+        cookie_count = 0
+        for line_number, raw_line in enumerate(normalized.split("\n"), start=1):
+            if not raw_line.strip():
+                continue
+
+            line = raw_line.strip()
+            if line.startswith("#") and not line.startswith("#HttpOnly_"):
+                lower = line.lower()
+                if lower.startswith("# netscape http cookie file") or lower.startswith("# http cookie file"):
+                    saw_header = True
+                continue
+
+            parts = raw_line.split("\t")
+            if len(parts) != 7:
+                return {
+                    "valid": False,
+                    "error": f"cookies file line {line_number} is not valid Netscape/Mozilla format",
+                    "count": None,
+                    "normalized_text": "",
+                }
+            domain, include_subdomains, path, secure, expires, name, _value = parts
+            if not domain or not path or not name:
+                return {
+                    "valid": False,
+                    "error": f"cookies file line {line_number} is missing required fields",
+                    "count": None,
+                    "normalized_text": "",
+                }
+            if include_subdomains.upper() not in {"TRUE", "FALSE"}:
+                return {
+                    "valid": False,
+                    "error": f"cookies file line {line_number} has invalid include-subdomains flag",
+                    "count": None,
+                    "normalized_text": "",
+                }
+            if secure.upper() not in {"TRUE", "FALSE"}:
+                return {
+                    "valid": False,
+                    "error": f"cookies file line {line_number} has invalid secure flag",
+                    "count": None,
+                    "normalized_text": "",
+                }
+            if expires and not re.fullmatch(r"-?\d+", expires):
+                return {
+                    "valid": False,
+                    "error": f"cookies file line {line_number} has invalid expiry value",
+                    "count": None,
+                    "normalized_text": "",
+                }
+            cookie_count += 1
+
+        if not saw_header:
+            return {
+                "valid": False,
+                "error": "cookies file is missing the Netscape/Mozilla header",
+                "count": None,
+                "normalized_text": "",
+            }
+        if cookie_count == 0:
+            return {
+                "valid": False,
+                "error": "cookies file contains no cookie entries",
+                "count": None,
+                "normalized_text": "",
+            }
+        return {
+            "valid": True,
+            "error": None,
+            "count": cookie_count,
+            "normalized_text": normalized.strip() + "\n",
+        }
+
+    def _write_cookies_sidecar_text(self, normalized_text: str) -> Optional[str]:
+        cookies_file = self._cookies_sidecar_path()
         tmp_path = None
-        replaced_existing = False
+        backup_path = None
         try:
             fd, tmp_name = tempfile.mkstemp(dir=str(self._base_dir), prefix=".cookies.", suffix=".tmp")
             tmp_path = Path(tmp_name)
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(normalized + "\n")
+                handle.write(normalized_text)
+                handle.flush()
+                os.fsync(handle.fileno())
 
-            # Fail closed: if replacement fails, never leave an old cookies.txt behind
-            # for Streamlink/yt-dlp to keep using.
             if cookies_file.exists():
-                cookies_file.unlink()
-                replaced_existing = True
+                backup_path = self._base_dir / ".cookies.txt.bak"
+                if backup_path.exists():
+                    backup_path.unlink()
+                os.replace(str(cookies_file), str(backup_path))
             os.replace(str(tmp_path), str(cookies_file))
+            if backup_path and backup_path.exists():
+                backup_path.unlink()
             self._log(f"Wrote cookies to {cookies_file}")
             return str(cookies_file)
         except Exception as exc:
-            action = "replace" if replaced_existing else "write"
-            self._log_error(f"Failed to {action} cookies file: {exc}")
-            if tmp_path is not None:
+            self._log_error(f"Failed to update cookies file: {type(exc).__name__}: {exc}")
+            for leftover in (tmp_path, backup_path, cookies_file):
+                if leftover is None:
+                    continue
                 try:
-                    tmp_path.unlink(missing_ok=True)
+                    Path(leftover).unlink(missing_ok=True)
                 except Exception:
                     pass
+            return None
+
+    def _get_cookies_file(self, cookies_content: str) -> Optional[str]:
+        """Validate raw Netscape/Mozilla cookies text and write the sidecar.
+
+        Blank content removes any previously persisted cookie file so stale
+        credentials are not left behind for Streamlink/yt-dlp to reuse.
+        """
+        if not (cookies_content or "").strip():
+            self._remove_cookies_file()
+            return None
+        parsed = self._validate_cookies_text(cookies_content)
+        if not parsed["valid"]:
+            self._log_error(f"Cookies not activated: {parsed['error']}")
             self._remove_cookies_file(log_missing=False)
             return None
+        return self._write_cookies_sidecar_text(parsed["normalized_text"])
+
+    def _get_cookies_metadata(self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        cookies_content = (settings or {}).get("cookies_content", "")
+        configured = bool((cookies_content or "").strip())
+        cookies_file = self._cookies_sidecar_path()
+        metadata = {
+            "configured": configured,
+            "valid": False,
+            "mtime": None,
+            "age_seconds": None,
+            "count": None,
+            "error": None,
+        }
+        if not configured:
+            return metadata
+        parsed = self._validate_cookies_text(cookies_content)
+        metadata["valid"] = bool(parsed.get("valid"))
+        metadata["count"] = parsed.get("count")
+        metadata["error"] = parsed.get("error")
+        if cookies_file.exists():
+            try:
+                stat = cookies_file.stat()
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=dt_timezone.utc)
+                metadata["mtime"] = mtime.isoformat()
+                metadata["age_seconds"] = max(0, int((datetime.now(tz=dt_timezone.utc) - mtime).total_seconds()))
+            except Exception:
+                metadata["mtime"] = None
+                metadata["age_seconds"] = None
+        return metadata
 
     def _remove_cookies_file(self, log_missing: bool = False) -> None:
         """Delete the plugin-owned cookies.txt if present."""
-        cookies_file = self._base_dir / "cookies.txt"
+        cookies_file = self._cookies_sidecar_path()
         try:
             if cookies_file.exists():
                 cookies_file.unlink()
@@ -1370,16 +1526,26 @@ class Plugin:
     def _sync_cookies_sidecar(self, settings: Optional[Dict[str, Any]]) -> bool:
         """Align plugin-owned cookies.txt with settings on normal lifecycle/save paths.
 
-        Returns True when the sidecar is in the desired state, or False when non-blank
-        cookie content was configured but could not be persisted.
+        Returns True when the sidecar is in the desired state, or False when
+        non-blank cookie content was configured but failed validation or
+        could not be persisted. Invalid content fails closed: it is not
+        activated, but an already-active sidecar written from previously
+        valid content is left alone — a bad new paste shouldn't take working
+        playback down. Only blank content (e.g. via Clear Cookies) removes
+        the sidecar.
         """
-        cookies_content = ""
-        if settings:
-            cookies_content = settings.get("cookies_content", "")
-        cookies_file = self._get_cookies_file(cookies_content)
-        return not (cookies_content or "").strip() or bool(cookies_file)
+        cookies_content = (settings or {}).get("cookies_content", "")
+        if not (cookies_content or "").strip():
+            self._remove_cookies_file()
+            return True
+        parsed = self._validate_cookies_text(cookies_content)
+        if not parsed["valid"]:
+            self._log_error(f"Cookies not activated: {parsed['error']}")
+            return False
+        cookies_file = self._write_cookies_sidecar_text(parsed["normalized_text"])
+        return bool(cookies_file)
 
-    def _extract_stream_metadata(self, video_id: str, quality_preference: str = "best", cookies_content: str = "") -> Optional[Dict[str, Any]]:
+    def _extract_stream_metadata(self, video_id: str, quality_preference: str = "best", cookie_settings: Any = "") -> Optional[Dict[str, Any]]:
         """Extract stream metadata and URL using yt-dlp command-line tool.
 
         Uses a fallback strategy:
@@ -1409,9 +1575,11 @@ class Plugin:
         cmd = base_cmd + [url]
         result = self._run_ytdlp_extract(video_id, cmd)
 
+        source_settings = cookie_settings if isinstance(cookie_settings, dict) else {"cookies_content": cookie_settings}
+
         # If first attempt failed and cookies are available, retry with cookies
-        if result is None and cookies_content:
-            cookies_file = self._get_cookies_file(cookies_content)
+        if result is None and self._cookies_are_configured(source_settings):
+            cookies_file = self._sync_cookies_sidecar(source_settings) and str(self._cookies_sidecar_path())
             if cookies_file:
                 self._log(f"First attempt failed for {video_id}, retrying with cookies...")
                 cmd = base_cmd + ["--cookies", cookies_file, url]
@@ -2187,8 +2355,7 @@ class Plugin:
         `--http-cookies-file` without exposing raw cookie content on the command line.
         """
         is_streamlink = self._profile_name_is_streamlink(getattr(profile, "name", ""))
-        cookies_content = ((settings or {}).get("cookies_content", "") if settings else "")
-        cookies_required = bool((cookies_content or "").strip())
+        cookies_required = self._cookies_are_configured(settings)
         if is_streamlink and cookies_required and not self._sync_cookies_sidecar(settings):
             raise RuntimeError("Configured cookies could not be synced to cookies.txt; refusing Streamlink playback update")
         if is_streamlink and not cookies_required:
@@ -2376,8 +2543,7 @@ class Plugin:
                         # New livestream detected
                         self._log(f"New stream detected: {video_id}, extracting metadata...")
                         quality = settings.get("stream_quality", "best")
-                        cookies_content = settings.get("cookies_content", "")
-                        metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
+                        metadata = self._extract_stream_metadata(video_id, quality, settings)
 
                         if not metadata:
                             self._log_error(f"Failed to extract metadata for {video_id} - yt-dlp returned None")
@@ -2828,8 +2994,7 @@ class Plugin:
                 if age_seconds > refresh_interval:
                     # Refresh needed
                     quality = settings.get("stream_quality", "best")
-                    cookies_content = settings.get("cookies_content", "")
-                    metadata = self._extract_stream_metadata(video_id, quality, cookies_content)
+                    metadata = self._extract_stream_metadata(video_id, quality, settings)
 
                     if metadata and metadata.get("stream_url"):
                         # Update Stream object
@@ -2839,7 +3004,7 @@ class Plugin:
                             # URL — Streamlink re-resolves it itself, so overwriting
                             # with yt-dlp's short-lived googlevideo URL would break it.
                             if self._is_streamlink_profile_id(getattr(stream, "stream_profile_id", None)):
-                                cookies_required = bool((cookies_content or "").strip())
+                                cookies_required = self._cookies_are_configured(settings)
                                 if cookies_required and not self._sync_cookies_sidecar(settings):
                                     self._log_error(
                                         f"Skipping Streamlink URL refresh for {video_id}: configured cookies could not be synced"

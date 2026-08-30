@@ -1,6 +1,6 @@
 # YouTubearr Changelog
 
-## [1.40.0] - 2026-08-29
+## [1.4.0] - 2026-08-30
 
 ### Added
 
@@ -8,11 +8,21 @@
 - If no `streamlink` profile is configured, YouTubearr logs a clear warning and falls back to the existing `proxy`-profile behavior, unchanged.
 - The explicit `stream_profile_name` setting (if configured) still takes priority over auto-detection, same as before.
 - URL refresh (`_refresh_expiring_urls`) now checks the stream's assigned profile: Streamlink-profile streams keep the canonical URL rather than being overwritten with a fresh (but still short-lived) googlevideo URL; Proxy-profile streams continue refreshing to the newly extracted URL as before.
+- **YouTube cookies now required for most Streamlink playback**: many channels need an authenticated request to resolve a playable watch URL. Paste a Netscape/Mozilla `cookies.txt` export (e.g. from the "Get cookies.txt LOCALLY" browser extension) into the **YouTube Cookies** setting — see the README's Configuration and Troubleshooting sections. YouTubearr persists the configured cookie content to `/data/plugins/youtubearr/cookies.txt` (mode `0600`) so an existing `streamlink` Stream Profile can reference it via `--http-cookies-file`; do not paste raw cookies into the Stream Profile parameters.
+- **Pasted cookie content is validated server-side** before activation: well-formed Netscape/Mozilla header, exactly 7 tab-separated fields per entry, at least one entry. Invalid content fails closed — it is not activated, and an already-active, previously-valid `cookies.txt` sidecar is left alone rather than torn down, so a bad paste can't take working playback down.
+- The sidecar write validates content, writes to a temp file, and fsyncs it before a controlled same-directory `os.replace` into place (mode `0600`), swapping any prior file to `.bak` first. This is fail-closed on error (leftovers are cleaned up and the failure is logged).
+- **Clear Cookies action**: Clears the configured `cookies_content` setting and deletes the active `/data/plugins/youtubearr/cookies.txt` sidecar. This is the only path that intentionally tears down a working cookie configuration.
+- **Diagnostics cookie status fields**: `cookies_configured`, `cookies_valid`, `cookies_count`, `cookies_last_modified`, and `cookies_age_seconds` replace the old `cookies_file_present` boolean, giving a clearer picture of cookie health without ever exposing raw cookie content in settings responses, logs, diagnostics, or webhooks.
 
 ### Internal
 
 - Added `_select_stream_profile`, `_get_playback_url`, `_profile_name_is_streamlink`, and `_is_streamlink_profile_id` helpers in `plugin.py`. `_get_stream_profile_id` is now a thin wrapper over `_select_stream_profile` for backward compatibility.
-- New tests: `TestSelectStreamProfile`, `TestGetPlaybackUrl`, plus two new cases in `TestRefreshExpiringUrls` covering the Streamlink vs. Proxy refresh branches.
+- New helpers for cookie handling: `_cookies_sidecar_path`, `_cookies_are_configured`, `_validate_cookies_text`, `_write_cookies_sidecar_text`, `_get_cookies_metadata`, and `_handle_clear_cookies`. `_sync_cookies_sidecar` validates `cookies_content` and fails closed on invalid content without deleting an existing valid sidecar.
+- New tests: `TestSelectStreamProfile`, `TestGetPlaybackUrl`, plus two new cases in `TestRefreshExpiringUrls` covering the Streamlink vs. Proxy refresh branches; `TestHandleClearCookies` (settings/sidecar teardown, no secret leakage in the response) and cookie-validation coverage in `TestGetCookiesFile`/`TestCookieSidecarLifecycle`/`TestCookiesPastedContentContract`. Diagnostics secrecy is covered by `TestDiagnostics.test_diagnostics_does_not_expose_cookies_content`.
+
+### Out of scope for this release
+
+- **Dispatcharr plugins-v3 manifest/capability compatibility** (`manifest_version`, `capabilities` declarations, sandbox enforcement) and **PO Token support** are deferred to a future release and are not part of v1.4.0.
 
 ## [1.30.0] - 2026-07-31
 

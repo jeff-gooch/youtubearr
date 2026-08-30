@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -61,6 +62,16 @@ def _phase1_result(entries):
 
 def _phase2_result(status):
     return MagicMock(stdout=status + "\n", returncode=0)
+
+
+def _netscape_cookie(marker=None):
+    """Build a structurally valid Netscape cookie file around a synthetic, non-secret marker.
+
+    Never pass real or credential-shaped strings here — callers that don't care about
+    the value should omit `marker` and get a fresh random one per call.
+    """
+    marker = marker if marker is not None else uuid.uuid4().hex
+    return f"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\t{marker}"
 
 
 # ── _get_live_streams_via_ytdlp ──────────────────────────────────────────────
@@ -859,7 +870,8 @@ class TestDiagnostics(unittest.TestCase):
         for field in ("plugin_version", "plugin_key", "monitoring_active", "monitor_thread_alive",
                       "last_poll_time", "tracked_stream_count", "extraction_failure_count",
                       "ytdlp_path", "ytdlp_version", "qjs_path", "qjs_version",
-                      "cookies_configured", "cookies_file_present",
+                      "cookies_configured", "cookies_valid", "cookies_last_modified",
+                      "cookies_age_seconds", "cookies_count",
                       "media_refresh_webhook_configured", "notification_webhook_configured",
                       "log_path"):
             self.assertIn(field, d, f"missing field: {field}")
@@ -1015,7 +1027,7 @@ class TestDiagnostics(unittest.TestCase):
 
     def test_diagnostics_does_not_expose_cookies_content(self):
         p = self._make_diag_plugin()
-        marker = "diagnostic-cookie-marker-xyz"
+        marker = uuid.uuid4().hex
         ctx = {"settings": {"cookies_content": f"# Netscape HTTP Cookie File\n.example.com\t{marker}"}}
         result = p._handle_diagnostics(ctx)
         details_str = json.dumps(result["details"], default=str)
@@ -1755,7 +1767,7 @@ class TestRefreshExpiringUrls(unittest.TestCase):
             "stream_id": 42,
             "title": "Live Stream",
         }
-        cookies_content = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
+        cookies_content = _netscape_cookie()
         settings = {
             "url_refresh_interval_seconds": 3600,
             "tracked_streams": {video_id: stream_data},
@@ -1793,7 +1805,7 @@ class TestRefreshExpiringUrls(unittest.TestCase):
         settings = {
             "url_refresh_interval_seconds": 3600,
             "tracked_streams": {video_id: stream_data},
-            "cookies_content": "configured-cookie",
+            "cookies_content": uuid.uuid4().hex,
         }
         p._extract_stream_metadata = MagicMock(return_value={"stream_url": "https://refreshed.example.com/stream.m3u8", "video_id": video_id})
         mock_stream = MagicMock(stream_profile_id=2)
@@ -1960,7 +1972,7 @@ class TestGetPlaybackUrl(unittest.TestCase):
         profile = MagicMock()
         profile.name = "streamlink"
         metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
-        cookies_content = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
+        cookies_content = _netscape_cookie()
         result = p._get_playback_url(metadata, profile, {"cookies_content": cookies_content})
         self.assertEqual(result, "https://www.youtube.com/watch?v=abc123DEF45")
         p._sync_cookies_sidecar.assert_called_once_with({"cookies_content": cookies_content})
@@ -1972,7 +1984,7 @@ class TestGetPlaybackUrl(unittest.TestCase):
         profile.name = "proxy"
         expiring_url = "https://googlevideo.com/expiring"
         metadata = {"video_id": "abc123DEF45", "stream_url": expiring_url}
-        result = p._get_playback_url(metadata, profile, {"cookies_content": "cookie-value"})
+        result = p._get_playback_url(metadata, profile, {"cookies_content": uuid.uuid4().hex})
         self.assertEqual(result, expiring_url)
         p._sync_cookies_sidecar.assert_not_called()
 
@@ -1982,9 +1994,10 @@ class TestGetPlaybackUrl(unittest.TestCase):
         profile = MagicMock()
         profile.name = "streamlink"
         metadata = {"video_id": "abc123DEF45", "stream_url": "https://googlevideo.com/expiring"}
+        configured_cookies = uuid.uuid4().hex
         with self.assertRaises(RuntimeError):
-            p._get_playback_url(metadata, profile, {"cookies_content": "configured-cookie"})
-        p._sync_cookies_sidecar.assert_called_once_with({"cookies_content": "configured-cookie"})
+            p._get_playback_url(metadata, profile, {"cookies_content": configured_cookies})
+        p._sync_cookies_sidecar.assert_called_once_with({"cookies_content": configured_cookies})
 
     def test_non_streamlink_profile_gets_extracted_url(self):
         p = _make_plugin()
@@ -2009,18 +2022,19 @@ class TestGetCookiesFile(unittest.TestCase):
 
     def test_writes_cookie_file_with_owner_only_permissions(self):
         p = _make_plugin()
+        content = _netscape_cookie()
         with tempfile.TemporaryDirectory() as tmpdir:
             p._base_dir = Path(tmpdir)
-            cookies_path = Path(p._get_cookies_file("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"))
+            cookies_path = Path(p._get_cookies_file(content))
             self.assertEqual(cookies_path, Path(tmpdir) / "cookies.txt")
-            self.assertEqual(cookies_path.read_text(), "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value\n")
+            self.assertEqual(cookies_path.read_text(), content + "\n")
             self.assertEqual(cookies_path.stat().st_mode & 0o777, 0o600)
 
     def test_blank_cookie_content_removes_stale_cookie_file(self):
         p = _make_plugin()
         with tempfile.TemporaryDirectory() as tmpdir:
             p._base_dir = Path(tmpdir)
-            cookies_path = Path(p._get_cookies_file("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"))
+            cookies_path = Path(p._get_cookies_file(_netscape_cookie()))
             self.assertTrue(cookies_path.exists())
             self.assertIsNone(p._get_cookies_file("   \n  "))
             self.assertFalse(cookies_path.exists())
@@ -2030,11 +2044,7 @@ class TestGetCookiesFile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             p._base_dir = Path(tmpdir)
             with patch("plugin.os.replace", side_effect=OSError("boom")):
-                self.assertIsNone(
-                    p._get_cookies_file(
-                        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcookie-value"
-                    )
-                )
+                self.assertIsNone(p._get_cookies_file(_netscape_cookie()))
 
             self.assertFalse((Path(tmpdir) / "cookies.txt").exists())
             self.assertEqual(list(Path(tmpdir).glob(".cookies.*.tmp")), [])
@@ -2044,13 +2054,9 @@ class TestGetCookiesFile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             p._base_dir = Path(tmpdir)
             cookies_path = Path(tmpdir) / "cookies.txt"
-            cookies_path.write_text("stale-cookie\n")
+            cookies_path.write_text("preexisting-placeholder-content\n")
             with patch("plugin.os.replace", side_effect=OSError("boom")):
-                self.assertIsNone(
-                    p._get_cookies_file(
-                        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnew-cookie"
-                    )
-                )
+                self.assertIsNone(p._get_cookies_file(_netscape_cookie()))
 
             self.assertFalse(cookies_path.exists())
             self.assertEqual(list(Path(tmpdir).glob(".cookies.*.tmp")), [])
@@ -2065,7 +2071,7 @@ class TestCookieSidecarLifecycle(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             p._base_dir = Path(tmpdir)
             cookies_path = Path(tmpdir) / "cookies.txt"
-            cookies_path.write_text("stale-cookie\n")
+            cookies_path.write_text("preexisting-placeholder-content\n")
 
             result = p.run("status", {}, {"settings": {"cookies_content": "   \n"}})
 
@@ -2074,15 +2080,115 @@ class TestCookieSidecarLifecycle(unittest.TestCase):
 
     def test_sync_cookies_sidecar_returns_false_when_nonblank_cookie_write_fails(self):
         p = _make_plugin()
-        p._get_cookies_file = MagicMock(return_value=None)
-        self.assertFalse(p._sync_cookies_sidecar({"cookies_content": "configured-cookie"}))
-        p._get_cookies_file.assert_called_once_with("configured-cookie")
+        p._write_cookies_sidecar_text = MagicMock(return_value=None)
+        valid_cookie = _netscape_cookie()
+        self.assertFalse(p._sync_cookies_sidecar({"cookies_content": valid_cookie}))
+        p._write_cookies_sidecar_text.assert_called_once()
 
     def test_sync_cookies_sidecar_preserves_no_cookie_operation(self):
         p = _make_plugin()
-        p._get_cookies_file = MagicMock(return_value=None)
+        p._remove_cookies_file = MagicMock()
         self.assertTrue(p._sync_cookies_sidecar({"cookies_content": "   "}))
-        p._get_cookies_file.assert_called_once_with("   ")
+        p._remove_cookies_file.assert_called_once()
+
+
+class TestCookiesPastedContentContract(unittest.TestCase):
+    """v1.4.0 pasted cookies_content: validation and fail-closed behaviour."""
+
+    def test_invalid_pasted_content_fails_closed_without_activating(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            settings = {"cookies_content": "not a real cookies file"}
+
+            self.assertFalse(p._sync_cookies_sidecar(settings))
+            self.assertFalse(p._cookies_sidecar_path().exists())
+
+    def test_invalid_pasted_content_preserves_existing_valid_sidecar(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            # Activate a valid sidecar first.
+            self.assertTrue(p._sync_cookies_sidecar({"cookies_content": _netscape_cookie()}))
+            original_text = p._cookies_sidecar_path().read_text()
+
+            # A subsequent paste that fails validation must not tear down
+            # the already-working sidecar.
+            result = p._sync_cookies_sidecar({"cookies_content": "not a real cookies file"})
+
+            self.assertFalse(result)
+            self.assertTrue(p._cookies_sidecar_path().exists())
+            self.assertEqual(p._cookies_sidecar_path().read_text(), original_text)
+
+    def test_pasted_cookies_sidecar_has_owner_only_permissions(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+
+            self.assertTrue(p._sync_cookies_sidecar({"cookies_content": _netscape_cookie()}))
+
+            mode = p._cookies_sidecar_path().stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+
+class TestHandleClearCookies(unittest.TestCase):
+
+    def test_clear_cookies_removes_settings_and_sidecar(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._persist_settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            marker = uuid.uuid4().hex
+            self.assertTrue(p._sync_cookies_sidecar({"cookies_content": _netscape_cookie(marker)}))
+            self.assertTrue(p._cookies_sidecar_path().exists())
+
+            context = {"settings": {"cookies_content": _netscape_cookie(marker)}}
+            result = p._handle_clear_cookies(context)
+
+            self.assertEqual(result["status"], "success")
+            p._persist_settings.assert_called_once_with({"cookies_content": ""})
+            self.assertEqual(context["settings"]["cookies_content"], "")
+            self.assertFalse(p._cookies_sidecar_path().exists())
+            self.assertNotIn(marker, json.dumps(result))
+
+    def test_clear_cookies_response_never_contains_raw_secrets(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._persist_settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            marker = uuid.uuid4().hex
+            result = p._handle_clear_cookies({"settings": {"cookies_content": _netscape_cookie(marker)}})
+            self.assertNotIn(marker, json.dumps(result))
+
+
+class TestDiagnosticsCookieSecrecy(unittest.TestCase):
+
+    def _make_diag_plugin(self):
+        p = _make_plugin()
+        p._plugin_key = "youtubearr"
+        p._monitor_thread = None
+        p._monitoring_active = False
+        p._log_path = MagicMock()
+        p._log_path.exists.return_value = False
+        p._get_ytdlp_version = MagicMock(return_value="2025.01.01")
+        p._get_qjs_version = MagicMock(return_value="not configured")
+        return p
+
+    def test_diagnostics_never_exposes_raw_cookie_value(self):
+        p = self._make_diag_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            secret_value = uuid.uuid4().hex
+
+            result = p._handle_diagnostics({"settings": {"cookies_content": _netscape_cookie(secret_value)}})
+
+            dumped = str(result)
+            self.assertNotIn(secret_value, dumped)
+            self.assertTrue(result["details"]["cookies_configured"])
+            self.assertTrue(result["details"]["cookies_valid"])
+            self.assertEqual(result["details"]["cookies_count"], 1)
 
 
 class TestHandleAddManualCookieSyncFailures(unittest.TestCase):
@@ -2880,8 +2986,8 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_40_0(self):
-        self.assertEqual(Plugin.version, "1.40.0")
+    def test_version_is_1_4_0(self):
+        self.assertEqual(Plugin.version, "1.4.0")
 
 
 # ── Lifecycle stop vs explicit stop hardening (v1.30.0) ─────────────────────
