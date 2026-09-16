@@ -2,7 +2,7 @@
 
 YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestreams and adds them as playable channels. It uses yt-dlp to detect when streams go live, creates Dispatcharr channels with proper EPG support, and cleans them up when streams end. No YouTube API quota required. I built this with Claude's help - we're all using AI now, I'm just honest about it. 🤖
 
-> **v1.40.0 playback note**: recent YouTube/yt-dlp changes mean Dispatcharr's default Proxy playback profile can 403 on many streams (see [Stream playback issues](#stream-playback-issues)). Fixing this requires a one-time Streamlink Stream Profile, and for most channels also a pasted YouTube `cookies.txt` export in the **YouTube Cookies** setting — see [Configuration](#configuration) and [Troubleshooting](#troubleshooting) below.
+> **v1.40.1 playback & monitoring note**: recent YouTube and yt-dlp changes mean YouTube increasingly challenges unauthenticated requests (bot checks, CAPTCHAs, HTTP 429, or format restrictions). Dispatcharr's default Proxy playback profile can 403 on many streams (see [Stream playback issues](#stream-playback-issues)). Reliable playback, discovery, and live-status verification will likely require configuring a **YouTube Cookies** export and using a Streamlink Stream Profile — see [YouTube Cookies and Authentication](#youtube-cookies-and-authentication) and [Troubleshooting](#troubleshooting) below.
 
 ## Features
 
@@ -69,10 +69,21 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
   - **Sequential**: Simple whole numbers (2000, 2001, 2002) for IPTV players that don't handle decimals
 - **Starting Channel Number**: First channel number to assign (default: 2000)
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
-- **YouTube Cookies**: Paste cookies in Netscape/Mozilla format (e.g. exported with the "Get cookies.txt LOCALLY" browser extension) for authenticated access. The plugin validates the pasted content server-side (Netscape header, well-formed entries) before activating `/data/plugins/youtubearr/cookies.txt`. When using a Dispatcharr Stream Profile named `streamlink`, add `--http-cookies-file /data/plugins/youtubearr/cookies.txt` to that profile once so Streamlink can read the plugin-managed cookie file. Use the **Clear Cookies** action to remove the configured cookies and delete the cookie sidecar. PO Token support is not included in this release and is not required for normal use.
+- **YouTube Cookies**: Paste cookies in Netscape/Mozilla format for authenticated requests and Streamlink playback. See [YouTube Cookies and Authentication](#youtube-cookies-and-authentication) below for setup, sidecar details, and maintenance.
 - **Channel Profile**: Optional Dispatcharr channel profile to automatically add new channels to
 - **EPG Source Name**: Name of the EPG source for guide data (default: "YouTube Live"). Supports `{title}` and `{channel}` placeholders.
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
+
+### YouTube Cookies and Authentication
+
+YouTube increasingly challenges unauthenticated requests from tools like yt-dlp and Streamlink with bot detection prompts, CAPTCHAs, HTTP 429 rate limits, and sign-in requirements. Consequently, reliable channel discovery, live-status verification, and stream playback will likely require exporting browser cookies.
+
+- **Required Format**: Cookies must be exported in standard Netscape/Mozilla format (a plain-text file beginning with `# Netscape HTTP Cookie File` and containing 7 tab-separated fields per entry), such as using the "Get cookies.txt LOCALLY" browser extension while logged into YouTube.
+- **Protected Setting & Sidecar Workflow**: Paste the full export into the **YouTube Cookies** (`cookies_content`) setting in the Dispatcharr UI. The plugin validates the header and line structure server-side before syncing the credentials to its protected sidecar file at `/data/plugins/youtubearr/cookies.txt` (mode `0600`). If the content fails validation, the plugin fails closed to prevent breaking an existing working sidecar.
+- **Streamlink Configuration**: When using a Dispatcharr Stream Profile named `streamlink`, include `--http-cookies-file /data/plugins/youtubearr/cookies.txt` in the profile arguments so Streamlink can consume the authenticated session. Do not paste raw cookies into Stream Profile command arguments.
+- **Clear Cookies Action**: Use the **Clear Cookies** (`clear_cookies`) action button to remove the stored cookie setting and delete the active `/data/plugins/youtubearr/cookies.txt` sidecar.
+- **Expiration and Refresh**: YouTube cookies expire periodically (typically after days to weeks, or upon browser logout/session invalidation). When livestreams fail to resolve or logs report bot/auth challenges, export a fresh `cookies.txt` file and paste it into the **YouTube Cookies** setting.
+- **Operational Security**: Never paste cookie contents into public chat, Discord channels, GitHub issues, or logs. YouTubearr automatically redacts video/channel IDs and never exposes cookie content in logs, diagnostics, or webhooks.
 
 ### Webhook Settings
 

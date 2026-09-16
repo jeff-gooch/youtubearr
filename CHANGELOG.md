@@ -1,5 +1,23 @@
 # YouTubearr Changelog
 
+## [1.40.1] - 2026-09-16
+
+### Fixed
+
+- **Live-Status Classification and Anomaly Diagnostics**: Classified Phase 2 live-status probe outputs into structured operational categories (`is_live`, `was_live`, `post_live`, `not_live`, `timeout`, `extraction error`, `empty/unknown status`, and `bot/auth failure`). YouTube bot detection, CAPTCHAs, and HTTP 429 challenges are now detected and logged cleanly without failing the background monitor loop or misclassifying channels as live. Direct live verification (`_verify_video_is_live`) fails safe on transient errors and bot/auth challenges to prevent premature channel teardown while streams are active.
+- **Cookie-Aware Phase 2 Probing**: Phase 2 live status probing (`_probe_live_status` / `_build_live_status_cmd`) now supplies the configured Netscape cookie sidecar file (`/data/plugins/youtubearr/cookies.txt`) and QuickJS runtime to yt-dlp, resolving false negatives during channel scans on accounts or networks where YouTube requires authentication for live status checks.
+- **yt-dlp Format Fallback for Split Streams**: Updated quality preference selector (`_get_format_string`) so "best" maps to `bestvideo+bestaudio/best` (matching the fallback behavior used for 1080p, 720p, and 480p). This resolves extraction failures ("Requested format is not available") on YouTube livestreams that only expose separate video and audio streams rather than pre-muxed formats.
+- **Monitor Lifecycle Reliability and Lock Distinction**: `_acquire_monitor_lock` and `_is_monitor_lock_held_by_other` now distinguish lock contention (`EAGAIN`/`EACCES`) from genuine filesystem `OSErrors` (permission denied, disk full, etc.). True errors are raised or logged rather than falsely reporting "Monitoring already active". In `_handle_start_monitoring`, a brief startup grace window verifies that the monitor thread did not immediately exit before reporting running status.
+- **Diagnostics Stale-Poll Accuracy**: `_handle_diagnostics` now incorporates operator-configured `poll_interval_minutes` from settings into the runtime state check, eliminating false "last poll is stale" warnings when running with longer poll intervals.
+
+### Changed
+
+- Diagnostic logs and error messages now redact full video IDs, channel identifiers, and URL query tokens to avoid leaking sensitive parameters or polluting logs with raw stderr dumps.
+
+### Out of scope for this release
+
+- **Replay after live (v1.50.0)** and **Dispatcharr plugins-v3 manifest compatibility (v2.0.0)** remain separate development efforts and are not part of v1.40.1.
+
 ## [1.40.0] - 2026-08-30
 
 ### Added

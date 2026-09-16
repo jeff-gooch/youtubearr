@@ -11,6 +11,7 @@ Or via deploy script:
     ./deploy.sh test --integration
 """
 import os
+from pathlib import Path
 import socket
 import sys
 import unittest
@@ -53,6 +54,7 @@ elif not _has_internet():
 
 def _make_plugin():
     p = Plugin.__new__(Plugin)
+    p._base_dir = Path(_ROOT)
     p._ytdlp_path = YTDLP_PATH
     p._qjs_path = QJS_PATH if os.path.exists(QJS_PATH) else None
     p._log = print

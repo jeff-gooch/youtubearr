@@ -263,6 +263,265 @@ class TestVerifyVideoIsLive(unittest.TestCase):
         self.assertIn("quickjs:/usr/bin/qjs", cmd)
 
 
+# ── Live-status probe classification, cookies, and error handling ───────────
+
+class TestLiveStatusProbeClassification(unittest.TestCase):
+    """Test classification of Phase 2 live status probe results."""
+
+    def setUp(self):
+        self.p = _make_plugin()
+
+    def test_classify_is_live(self):
+        result = self.p._classify_probe_result(0, "is_live\n", "", "abc123")
+        self.assertEqual(result["status"], "is_live")
+        self.assertTrue(result["is_live"])
+        self.assertFalse(result["is_error"])
+
+    def test_classify_was_live(self):
+        result = self.p._classify_probe_result(0, "was_live\n", "", "abc123")
+        self.assertEqual(result["status"], "was_live")
+        self.assertFalse(result["is_live"])
+        self.assertFalse(result["is_error"])
+
+    def test_classify_post_live(self):
+        result = self.p._classify_probe_result(0, "post_live\n", "", "abc123")
+        self.assertEqual(result["status"], "post_live")
+        self.assertFalse(result["is_live"])
+        self.assertFalse(result["is_error"])
+
+    def test_classify_not_live(self):
+        result = self.p._classify_probe_result(0, "not_live\n", "", "abc123")
+        self.assertEqual(result["status"], "not_live")
+        self.assertFalse(result["is_live"])
+        self.assertFalse(result["is_error"])
+
+    def test_classify_timeout_via_probe(self):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("yt-dlp", 30)):
+            result = self.p._probe_live_status("abc123")
+        self.assertEqual(result["status"], "timeout")
+        self.assertFalse(result["is_live"])
+        self.assertTrue(result["is_error"])
+
+    def test_classify_extraction_error_non_zero_exit(self):
+        stderr = "ERROR: [youtube] abc123: Requested format is not available"
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "extraction error")
+        self.assertFalse(result["is_live"])
+        self.assertTrue(result["is_error"])
+        # Must not be categorized as not_live or empty_unknown
+        self.assertNotEqual(result["status"], "not_live")
+        self.assertNotEqual(result["status"], "empty/unknown status")
+
+    def test_classify_empty_output_with_zero_exit_is_empty_unknown_not_live(self):
+        result = self.p._classify_probe_result(0, "   \n", "", "abc123")
+        self.assertEqual(result["status"], "empty/unknown status")
+        self.assertFalse(result["is_live"])
+        self.assertFalse(result["is_error"])
+        # Regression guard: empty output must NOT be classified as not_live
+        self.assertNotEqual(result["status"], "not_live")
+
+    def test_classify_upcoming_status_is_empty_unknown(self):
+        result = self.p._classify_probe_result(0, "is_upcoming\n", "", "abc123")
+        self.assertEqual(result["status"], "empty/unknown status")
+        self.assertFalse(result["is_live"])
+        self.assertFalse(result["is_error"])
+
+    def test_classify_bot_auth_failure_sign_in(self):
+        stderr = "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. This helps protect our community."
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "bot/auth failure")
+        self.assertFalse(result["is_live"])
+        self.assertTrue(result["is_error"])
+        self.assertNotEqual(result["status"], "not_live")
+
+    def test_classify_bot_auth_failure_http_429(self):
+        stderr = "ERROR: Unable to download webpage: HTTP Error 429: Too Many Requests"
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "bot/auth failure")
+        self.assertTrue(result["is_error"])
+
+    def test_classify_bot_auth_failure_private_video(self):
+        stderr = "ERROR: [youtube] abc123: Private video. Sign in if you've been granted access to this video"
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "bot/auth failure")
+        self.assertTrue(result["is_error"])
+
+    def test_classify_bot_auth_failure_members_only(self):
+        stderr = "ERROR: [youtube] abc123: Join this channel to get access to members-only content"
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "bot/auth failure")
+        self.assertTrue(result["is_error"])
+
+    def test_classify_bot_auth_failure_captcha(self):
+        stderr = "ERROR: [youtube] abc123: CAPTCHA required before proceeding"
+        result = self.p._classify_probe_result(1, "", stderr, "abc123")
+        self.assertEqual(result["status"], "bot/auth failure")
+        self.assertTrue(result["is_error"])
+
+
+class TestLiveStatusProbeCookieUsage(unittest.TestCase):
+    """Test cookie sidecar and auth argument passing to live-status probe."""
+
+    def test_probe_cmd_includes_cookies_when_settings_configured(self):
+        p = _make_plugin()
+        p._sync_cookies_sidecar = MagicMock(return_value=True)
+        cookie_text = _netscape_cookie("secret_token_12345")
+        cmd = p._build_live_status_cmd("abc123", settings={"cookies_content": cookie_text})
+        self.assertIn("--cookies", cmd)
+        idx = cmd.index("--cookies")
+        self.assertEqual(cmd[idx + 1], str(p._cookies_sidecar_path()))
+        # Crucial security check: raw cookie content must NEVER appear on the command line
+        self.assertNotIn("secret_token_12345", " ".join(cmd))
+
+    def test_probe_cmd_includes_cookies_when_sidecar_file_exists_on_disk(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cookies_file = p._cookies_sidecar_path()
+            cookies_file.write_text("valid cookies\n")
+            cmd = p._build_live_status_cmd("abc123", settings={})
+            self.assertIn("--cookies", cmd)
+            self.assertEqual(cmd[cmd.index("--cookies") + 1], str(cookies_file))
+
+    def test_probe_cmd_omits_cookies_when_not_configured_and_no_file(self):
+        p = _make_plugin()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p._base_dir = Path(tmpdir)
+            cmd = p._build_live_status_cmd("abc123", settings={})
+            self.assertNotIn("--cookies", cmd)
+
+    def test_probe_cmd_does_not_contain_quiet_flag(self):
+        p = _make_plugin()
+        cmd = p._build_live_status_cmd("abc123")
+        self.assertNotIn("--quiet", cmd)
+        self.assertIn("--skip-download", cmd)
+        self.assertIn("--print", cmd)
+        self.assertEqual(cmd[cmd.index("--print") + 1], "live_status")
+
+
+class TestLiveStatusProbeErrorAndUnknownHandling(unittest.TestCase):
+    """Test Phase 2 and _verify_video_is_live error and unknown status handling."""
+
+    def test_phase2_bot_auth_failure_skips_candidate_without_recording_extraction_failure(self):
+        p = _make_plugin()
+        entries = [{"id": "abc123", "title": "Stream"}]
+        mock_result = MagicMock(
+            stdout="",
+            stderr="ERROR: [youtube] abc123: Sign in to confirm you’re not a bot",
+            returncode=1,
+        )
+        with patch("subprocess.run", side_effect=[_phase1_result(entries), mock_result]):
+            result = p._get_live_streams_via_ytdlp("@nasa", {})
+        self.assertEqual(result, [])
+        # Crucial check: transient probe error must NOT record in _extraction_failures (no 24h lockout)
+        self.assertNotIn("abc123", p._extraction_failures)
+
+    def test_phase2_empty_output_error_not_treated_as_not_live(self):
+        p = _make_plugin()
+        p._log = MagicMock()
+        p._log_error = MagicMock()
+        entries = [{"id": "abc123", "title": "NASA Stream"}]
+        mock_error = MagicMock(
+            stdout="",
+            stderr="ERROR: [youtube] abc123: Sign in to confirm you're not a bot",
+            returncode=1,
+        )
+        with patch("subprocess.run", side_effect=[_phase1_result(entries), mock_error]):
+            result = p._get_live_streams_via_ytdlp("@nasa", {})
+        self.assertEqual(result, [])
+        # Verify log indicates bot/auth failure, NOT "Not live"
+        logged_errors = [call.args[0] for call in p._log_error.call_args_list]
+        self.assertTrue(any("bot/auth failure" in msg for msg in logged_errors))
+        logged_info = [call.args[0] for call in p._log.call_args_list]
+        self.assertFalse(any("Not live (no status)" in msg for msg in logged_info))
+
+    def test_verify_video_is_live_fails_safe_on_bot_auth_error(self):
+        p = _make_plugin()
+        mock_res = MagicMock(
+            stdout="",
+            stderr="ERROR: [youtube] abc123: Sign in to confirm you’re not a bot",
+            returncode=1,
+        )
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertTrue(p._verify_video_is_live("abc123"))
+
+    def test_verify_video_is_live_fails_safe_on_extraction_error(self):
+        p = _make_plugin()
+        mock_res = MagicMock(
+            stdout="",
+            stderr="ERROR: [youtube] abc123: Video unavailable",
+            returncode=1,
+        )
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertTrue(p._verify_video_is_live("abc123"))
+
+    def test_verify_video_is_live_fails_safe_on_empty_status(self):
+        p = _make_plugin()
+        mock_res = MagicMock(stdout="\n", stderr="", returncode=0)
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertTrue(p._verify_video_is_live("abc123"))
+
+    def test_verify_video_is_live_returns_false_on_was_live(self):
+        p = _make_plugin()
+        mock_res = MagicMock(stdout="was_live\n", stderr="", returncode=0)
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertFalse(p._verify_video_is_live("abc123"))
+
+    def test_verify_video_is_live_returns_false_on_post_live(self):
+        p = _make_plugin()
+        mock_res = MagicMock(stdout="post_live\n", stderr="", returncode=0)
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertFalse(p._verify_video_is_live("abc123"))
+
+    def test_verify_video_is_live_returns_false_on_not_live(self):
+        p = _make_plugin()
+        mock_res = MagicMock(stdout="not_live\n", stderr="", returncode=0)
+        with patch("subprocess.run", return_value=mock_res):
+            self.assertFalse(p._verify_video_is_live("abc123"))
+
+
+class TestLiveStatusDiagnosticRedaction(unittest.TestCase):
+    """Test safe diagnostic extraction and ID redaction."""
+
+    def setUp(self):
+        self.p = _make_plugin()
+
+    def test_redact_id_formats(self):
+        self.assertEqual(self.p._redact_id("testid12345"), "tes...45")
+        self.assertEqual(self.p._redact_id("abc123"), "abc...23")
+        self.assertEqual(self.p._redact_id("abcd"), "[REDACTED_ID]")
+        self.assertEqual(self.p._redact_id(""), "[REDACTED_ID]")
+        self.assertEqual(self.p._redact_id(None), "[REDACTED_ID]")
+
+    def test_extract_actionable_stderr_redacts_video_id_and_urls(self):
+        stderr = (
+            "ERROR: [youtube] testid12345: Sign in at https://example.com/verify "
+            "to confirm you’re not a bot. This helps protect our community."
+        )
+        msg = self.p._extract_actionable_stderr(stderr, "testid12345")
+        self.assertNotIn("testid12345", msg)
+        self.assertIn("tes...45", msg)
+        self.assertNotIn("example.com", msg)
+        self.assertIn("[URL]", msg)
+
+    def test_phase2_logging_redacts_id_on_bot_failure(self):
+        self.p._log_error = MagicMock()
+        entries = [{"id": "testid12345", "title": "Example Feed"}]
+        mock_error = MagicMock(
+            stdout="",
+            stderr="ERROR: [youtube] testid12345: Sign in to confirm you're not a bot",
+            returncode=1,
+        )
+        with patch("subprocess.run", side_effect=[_phase1_result(entries), mock_error]):
+            self.p._get_live_streams_via_ytdlp("@nasa", {})
+
+        logged_errors = [call.args[0] for call in self.p._log_error.call_args_list]
+        self.assertTrue(len(logged_errors) > 0)
+        for msg in logged_errors:
+            self.assertNotIn("testid12345", msg)
+            self.assertIn("tes...45", msg)
+
+
 # ── _get_next_subchannel_number ──────────────────────────────────────────────
 
 class TestSubchannelNumbering(unittest.TestCase):
@@ -1385,7 +1644,7 @@ class TestCeleryCleanup(unittest.TestCase):
             mock_cfg.DoesNotExist = type("DoesNotExist", (Exception,), {})
             mock_cfg.objects.get.side_effect = mock_cfg.DoesNotExist
             with patch("threading.Thread") as mock_thread:
-                mock_thread.return_value.is_alive.return_value = False
+                mock_thread.return_value.is_alive.return_value = True  # thread started and stayed alive
                 p._handle_start_monitoring({"settings": {"monitored_channels": "@nasa"}})
         self.assertTrue(cleanup_calls)
 
@@ -1632,6 +1891,45 @@ class TestDiagnosticsNewFields(unittest.TestCase):
         # age is still populated but status is not warning *due to* the poll check)
         age = result["details"].get("last_poll_age_seconds")
         self.assertIsNotNone(age)  # field is present regardless
+
+    def test_stale_poll_check_uses_configured_interval_from_settings(self):
+        """poll_interval_minutes for the stale-poll check must come from the
+        plugin's actual settings, not silently default to 15 min — runtime_state
+        never stores it, so a short configured interval's genuine staleness
+        must not be masked by the fallback default."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        poll_20_min_ago = (datetime.now(dt_timezone.utc) - timedelta(minutes=20)).isoformat()
+        p._read_runtime_state.return_value = {
+            "desired_active": True,
+            "last_poll_time": poll_20_min_ago,
+        }
+        settings = {"poll_interval_minutes": 1}  # threshold = 11 min; 20 min age is stale
+        result = p._handle_diagnostics({"settings": settings})
+        next_actions = result["details"].get("next_actions", [])
+        self.assertIn(
+            "Click 'Refresh Now' to trigger an immediate poll, or restart monitoring",
+            next_actions,
+        )
+
+    def test_no_stale_poll_warning_when_configured_interval_covers_age(self):
+        """The same 20-minute-old poll is NOT stale under a 30-minute configured
+        interval (threshold = interval + 10 min grace) — proving the check
+        reads the real configured interval rather than a hardcoded default."""
+        from datetime import datetime, timezone as dt_timezone, timedelta
+        p = self._make_p()
+        poll_20_min_ago = (datetime.now(dt_timezone.utc) - timedelta(minutes=20)).isoformat()
+        p._read_runtime_state.return_value = {
+            "desired_active": True,
+            "last_poll_time": poll_20_min_ago,
+        }
+        settings = {"poll_interval_minutes": 30}  # threshold = 40 min; 20 min age is fresh
+        result = p._handle_diagnostics({"settings": settings})
+        next_actions = result["details"].get("next_actions", [])
+        self.assertNotIn(
+            "Click 'Refresh Now' to trigger an immediate poll, or restart monitoring",
+            next_actions,
+        )
 
     def test_epg_window_counts_present_in_details(self):
         p = self._make_p()
@@ -1943,6 +2241,52 @@ class TestSelectStreamProfile(unittest.TestCase):
             result = p._select_stream_profile({})
         self.assertEqual(result, streamlink_profile)
         mock_cls.objects.filter.assert_not_called()
+
+
+# ── yt-dlp format string selection ──────────────────────────────────────────
+
+class TestGetFormatString(unittest.TestCase):
+    """_get_format_string maps quality preferences to yt-dlp --format selectors.
+
+    "best" must allow separate video/audio streams with a merge fallback —
+    bare "best" only matches pre-muxed formats and fails with "Requested
+    format is not available" on livestreams that only expose split streams.
+    """
+
+    def test_best_allows_separate_video_and_audio_with_fallback(self):
+        p = _make_plugin()
+        self.assertEqual(p._get_format_string("best"), "bestvideo+bestaudio/best")
+
+    def test_1080p_preserved(self):
+        p = _make_plugin()
+        self.assertEqual(p._get_format_string("1080p"), "bestvideo[height<=1080]+bestaudio/best")
+
+    def test_720p_preserved(self):
+        p = _make_plugin()
+        self.assertEqual(p._get_format_string("720p"), "bestvideo[height<=720]+bestaudio/best")
+
+    def test_480p_preserved(self):
+        p = _make_plugin()
+        self.assertEqual(p._get_format_string("480p"), "bestvideo[height<=480]+bestaudio/best")
+
+    def test_unknown_preference_falls_back_to_best_selector(self):
+        p = _make_plugin()
+        self.assertEqual(p._get_format_string("nonsense"), "bestvideo+bestaudio/best")
+
+    def test_extract_stream_metadata_passes_selector_to_ytdlp_format_flag(self):
+        p = _make_plugin()
+        captured_cmd = {}
+
+        def fake_run(video_id, cmd, is_retry=False):
+            captured_cmd["cmd"] = cmd
+            return {"video_id": video_id}
+
+        p._run_ytdlp_extract = fake_run
+        p._extract_stream_metadata("abc123", quality_preference="best")
+
+        cmd = captured_cmd["cmd"]
+        self.assertIn("--format", cmd)
+        self.assertEqual(cmd[cmd.index("--format") + 1], "bestvideo+bestaudio/best")
 
 
 # ── Canonical playback URL selection ────────────────────────────────────────
@@ -2579,6 +2923,101 @@ class TestHandleStartMonitoringBehavior(unittest.TestCase):
             result = p._handle_start_monitoring({"settings": settings})
         self.assertEqual(result["status"], "error")
 
+    def test_real_lock_oserror_returns_error_not_already_active(self):
+        """A genuine OSError acquiring the lock (disk full, permission denied)
+        must not be reported as 'Monitoring already active' — that's only
+        true for lock contention, which _acquire_monitor_lock now signals
+        by returning False rather than raising."""
+        import errno as _errno
+        p = self._make_p()
+        p._acquire_monitor_lock = MagicMock(side_effect=OSError(_errno.ENOSPC, "disk full"))
+        settings = {"monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("already active", result["message"].lower())
+
+    def test_thread_dies_immediately_reports_error_not_running(self):
+        """If the monitor thread exits right after start() (e.g. an exception
+        before it reaches the monitoring loop's own try block), the response
+        must be truthful about it instead of always claiming 'running'."""
+        p = self._make_p()
+        p._monitoring_loop = lambda plugin_key: None  # returns immediately
+        settings = {"monitored_channels": "@nasa"}
+        with patch("plugin.PluginConfig", _mock_cfg(settings)):
+            result = p._handle_start_monitoring({"settings": settings})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("failed to start", result["message"].lower())
+        p._release_monitor_lock.assert_called_once()
+
+    def test_thread_survives_grace_window_reports_running(self):
+        """Sanity check: a thread that is still alive past the brief startup
+        grace window is truthfully reported as running (normal happy path)."""
+        p = self._make_p()
+        release_event = threading.Event()
+        p._monitoring_loop = lambda plugin_key: release_event.wait(timeout=5)
+        settings = {"monitored_channels": "@nasa"}
+        try:
+            with patch("plugin.PluginConfig", _mock_cfg(settings)):
+                result = p._handle_start_monitoring({"settings": settings})
+            self.assertEqual(result["status"], "running")
+            self.assertTrue(p._monitor_thread.is_alive())
+        finally:
+            release_event.set()
+            p._monitor_thread.join(timeout=5)
+
+
+# ── _acquire_monitor_lock / _is_monitor_lock_held_by_other error handling ───
+
+class TestMonitorLockErrorDistinction(unittest.TestCase):
+    """Lock contention (EACCES/EAGAIN from flock) must be distinguished from
+    real OSErrors (permission denied opening the file, disk full, ...) so
+    callers never mistake a genuine failure for 'another worker is active'."""
+
+    def _make_p(self):
+        p = _make_plugin()
+        p._lock_path = p._base_dir / "monitor.lock"
+        p._lock_fd = None
+        return p
+
+    def test_acquire_contention_errno_returns_false(self):
+        import errno as _errno
+        p = self._make_p()
+        with patch("plugin.fcntl.flock", side_effect=OSError(_errno.EAGAIN, "locked")):
+            acquired = Plugin._acquire_monitor_lock(p)
+        self.assertFalse(acquired)
+        self.assertIsNone(p._lock_fd)
+
+    def test_acquire_real_oserror_propagates(self):
+        import errno as _errno
+        p = self._make_p()
+        with patch("plugin.fcntl.flock", side_effect=OSError(_errno.ENOSPC, "disk full")):
+            with self.assertRaises(OSError):
+                Plugin._acquire_monitor_lock(p)
+        self.assertIsNone(p._lock_fd)
+
+    def test_acquire_succeeds_with_real_lock(self):
+        p = self._make_p()
+        self.assertTrue(Plugin._acquire_monitor_lock(p))
+        self.assertIsNotNone(p._lock_fd)
+        Plugin._release_monitor_lock(p)
+
+    def test_probe_contention_errno_returns_true(self):
+        import errno as _errno
+        p = self._make_p()
+        with patch("plugin.fcntl.flock", side_effect=OSError(_errno.EACCES, "locked")):
+            held = Plugin._is_monitor_lock_held_by_other(p)
+        self.assertTrue(held)
+
+    def test_probe_real_oserror_returns_false_not_held(self):
+        """A real OSError probing the lock must not be reported as 'held by
+        another worker' — that would falsely imply monitoring is active."""
+        import errno as _errno
+        p = self._make_p()
+        with patch("plugin.fcntl.flock", side_effect=OSError(_errno.EIO, "io error")):
+            held = Plugin._is_monitor_lock_held_by_other(p)
+        self.assertFalse(held)
+
 
 # ── _cleanup_ended_streams ───────────────────────────────────────────────────
 
@@ -2986,8 +3425,8 @@ class TestAutoStartAndRaceFix(unittest.TestCase):
 
     # ── version ──────────────────────────────────────────────────────────────
 
-    def test_version_is_1_40_0(self):
-        self.assertEqual(Plugin.version, "1.40.0")
+    def test_version_is_1_40_1(self):
+        self.assertEqual(Plugin.version, "1.40.1")
 
 
 # ── Lifecycle stop vs explicit stop hardening (v1.30.0) ─────────────────────
