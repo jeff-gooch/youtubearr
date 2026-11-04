@@ -146,6 +146,14 @@ class Plugin:
             "help_text": "Name of Channel Profile to add created channels to (e.g., 'Primary'). Leave empty to skip.",
         },
         {
+            "id": "stream_profile_name",
+            "label": "Stream Profile",
+            "type": "select",
+            "options": [{"value": name, "label": name} for name in StreamProfile.objects.values_list("name", flat=True)],
+            "default": StreamProfile.objects.filter(name__iexact="streamlink").first().name,
+            "help_text": "The Stream Profile to use.",
+        },
+        {
             "id": "starting_channel_number",
             "label": "Starting Channel Number",
             "type": "number",
